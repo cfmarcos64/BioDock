@@ -1,14 +1,26 @@
-streamlit
-stmol
-py3Dmol
+# --- Núcleo de la app ---
+streamlit>=1.40
 biopython
+py3Dmol
+stmol
+ipython_genutils      # stmol importa ipywidgets, que lo necesita
+numpy
+pandas
+scipy                 # RMSD de respaldo y utilidades
+
+# --- Preparación de ligandos y receptor ---
 rdkit
 openbabel-wheel
 meeko
-gemmi
+gemmi                 # lo necesita Meeko
+pdb2pqr               # incluye PROPKA
+
+# --- Interacciones (PLIP) ---
 plip
-pdb2pqr
-propka
-vina
-scipy
-numpy
+
+# --- Docking: el paquete `vina` solo tiene ruedas para Linux y Python <= 3.12 ---
+vina; sys_platform == "linux" and python_version < "3.13"
+
+# --- Opcional: exportar la sesión .pse de PyMOL. Descomenta si quieres el .pse real
+# (si falla la instalación, la app entrega un script .pml en su lugar) ---
+# pymol-open-source>=3.0.0a0
