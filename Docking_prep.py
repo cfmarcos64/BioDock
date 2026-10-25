@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 BioDock Studio: Protein Parser, Inspector & Docking Prep
-v8 — v7 + sesión PyMOL (.pse), docking con Vina integrado, RMSD de redocking, caja con ligando externo.
+v9 — sesión PyMOL (.pse), docking con Vina integrado (paquete Python o ejecutable), RMSD de redocking,
+caja con ligando externo, bolsillo y contorno corregidos.
 """
 
 import base64
@@ -13,6 +14,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -497,8 +499,9 @@ def build_3dmol_view(pdb_str, ligand_str, style_type, color_mode, show_protein, 
     if inter and inter.get("items"):
         draw_interactions(view, prot_idx, inter["items"], inter.get("labels", True))
 
-    if show_pocket and lig_idx is not None:
-        view.zoomTo({'model': lig_idx})     # centra la vista en el sitio activo
+    if show_pocket and prot_idx is not None:
+        sels = [{'model': prot_idx, 'chain': ch, 'resi': sorted(nums)} for ch, nums in by_chain.items()]
+        view.zoomTo(sels[0] if len(sels) == 1 else {'or': sels})     # centra la vista en el bolsillo
     else:
         view.zoomTo()
     if spin:
@@ -1045,6 +1048,16 @@ def _res_color(resname):
     return "#9aa0aa"
 
 
+def heavy_atoms(mol):
+    """Molécula sin H. Con sanitización (recalcula los H implícitos de los aromáticos); si falla, sin ella."""
+    try:
+        return Chem.RemoveHs(mol)
+    except Exception:
+        h = Chem.RemoveHs(mol, sanitize=False)
+        h.UpdatePropertyCache(strict=False)
+        return h
+
+
 def ligand_mol_for_map(lig_pdb, smiles=""):
     """Molécula RDKit del ligando (con órdenes de enlace si el SMILES encaja) y coordenadas 3D."""
     mol = None
@@ -1070,7 +1083,7 @@ def interaction_map_svg(mol, items, title="", dark=True, width=900, height=720):
     from rdkit.Chem import rdDepictor
     from rdkit.Chem.Draw import rdMolDraw2D
 
-    heavy = Chem.RemoveHs(mol, sanitize=False)
+    heavy = heavy_atoms(mol)
     if heavy.GetNumConformers() == 0:
         raise ValueError("El ligando no tiene coordenadas 3D.")
     conf = heavy.GetConformer()
@@ -1329,7 +1342,7 @@ def build_pose_complex(protein_pdb, mol, chain="Z", resname="LIG", resnum=1):
     ter = f"TER   {last + 1:5d}"
     serial = last + 2
 
-    heavy = Chem.RemoveHs(mol, sanitize=False)
+    heavy = heavy_atoms(mol)
     block = Chem.MolToPDBBlock(heavy)
     ser_map, lig_lines = {}, []
     for l in block.splitlines():
@@ -1375,7 +1388,7 @@ def build_pose_view(protein_pdb, mol, items, labels=True, ref_ligand_pdb=""):
     view.setBackgroundColor('#000000')
     view.addModel(protein_pdb, "pdb")
     view.setStyle({'model': 0}, {'cartoon': {'color': '#9aa0aa', 'opacity': 0.85}})
-    heavy = Chem.RemoveHs(mol, sanitize=False)
+    heavy = heavy_atoms(mol)
     view.addModel(Chem.MolToMolBlock(heavy, kekulize=False), "sdf")
     view.setStyle({'model': 1}, {'stick': {'colorscheme': 'magentaCarbon', 'radius': 0.25}})
     if ref_ligand_pdb.strip():
@@ -1589,7 +1602,7 @@ def export_pymol_session(complex_pdb, key, items, lig_sel):
 def _skeleton(mol):
     """Átomos pesados y enlaces simples (sin órdenes): permite comparar grafos de distinta procedencia."""
     import numpy as np
-    heavy = Chem.RemoveHs(mol, sanitize=False)
+    heavy = heavy_atoms(mol)
     rw = Chem.RWMol()
     for a in heavy.GetAtoms():
         rw.AddAtom(Chem.Atom(a.GetAtomicNum()))
@@ -1634,9 +1647,73 @@ def ligand_rmsd(pose, ref):
         return None, "los grafos de la pose y la referencia no coinciden"
 
 
+def find_vina_exe(custom=""):
+    """Localiza el ejecutable oficial de Vina: ruta indicada, junto al script/directorio actual o en el PATH."""
+    cands = []
+    if custom and custom.strip():
+        cands.append(custom.strip().strip('"'))
+    dirs = [os.getcwd()]
+    try:
+        dirs.append(os.path.dirname(os.path.abspath(__file__)))
+    except NameError:
+        pass
+    skip = (".py", ".pdbqt", ".txt", ".zip", ".md", ".log", ".pdb", ".sdf")
+    for d in dirs:
+        try:
+            for f in sorted(os.listdir(d)):
+                fl = f.lower()
+                if fl.startswith("vina") and not fl.startswith("vina_split") and not fl.endswith(skip) \
+                        and os.path.isfile(os.path.join(d, f)):
+                    cands.append(os.path.join(d, f))
+        except OSError:
+            pass
+    cands += ["vina", "vina.exe"]
+    for c in cands:
+        path = c if os.path.isfile(c) else shutil.which(c)
+        if not path:
+            continue
+        try:
+            r = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=20)
+            if "vina" in (r.stdout + r.stderr).lower():
+                return path
+        except Exception:
+            continue
+    return None
+
+
+def _run_vina_exe(exe, receptor_pdbqt, ligand_pdbqt, center, size, exhaustiveness, n_poses, energy_range,
+                  seed, cpu, scoring):
+    with tempfile.TemporaryDirectory() as td:
+        rp, lp, op = (os.path.join(td, n) for n in ("receptor.pdbqt", "ligand.pdbqt", "out.pdbqt"))
+        with open(rp, "w") as f:
+            f.write(receptor_pdbqt)
+        with open(lp, "w") as f:
+            f.write(ligand_pdbqt)
+        cmd = [exe, "--receptor", rp, "--ligand", lp, "--out", op,
+               "--center_x", f"{center[0]:.3f}", "--center_y", f"{center[1]:.3f}", "--center_z", f"{center[2]:.3f}",
+               "--size_x", f"{size[0]:.1f}", "--size_y", f"{size[1]:.1f}", "--size_z", f"{size[2]:.1f}",
+               "--exhaustiveness", str(int(exhaustiveness)), "--num_modes", str(max(int(n_poses), 1)),
+               "--energy_range", str(float(energy_range)), "--seed", str(int(seed)),
+               "--cpu", str(int(cpu)), "--scoring", scoring]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+        if proc.returncode != 0 or not os.path.exists(op):
+            raise RuntimeError((proc.stderr or proc.stdout or "Vina terminó sin resultados").strip()[-300:])
+        with open(op) as f:
+            pdbqt = f.read()
+    energies = [[a, b, c] for a, b, c in
+                (tuple(float(x) for x in m.groups()) for m in _SCORE_RE.finditer(pdbqt))]
+    return pdbqt, energies
+
+
 def run_vina(receptor_pdbqt, ligand_pdbqt, center, size, exhaustiveness, n_poses, energy_range,
-             seed, cpu, scoring):
-    """Docking con la API Python de AutoDock Vina. Devuelve (pdbqt de poses, energías)."""
+             seed, cpu, scoring, exe=None):
+    """Docking con Vina: paquete Python (si no se fuerza el ejecutable) o ejecutable oficial.
+    Devuelve (pdbqt de poses, energías por pose; la primera columna es la afinidad)."""
+    if exe or not HAS_VINA:
+        if not exe:
+            raise RuntimeError("No hay motor de Vina disponible (ni paquete Python ni ejecutable).")
+        return _run_vina_exe(exe, receptor_pdbqt, ligand_pdbqt, center, size, exhaustiveness, n_poses,
+                             energy_range, seed, cpu, scoring)
     from vina import Vina
     with tempfile.TemporaryDirectory() as td:
         rp = os.path.join(td, "receptor.pdbqt")
@@ -1785,9 +1862,16 @@ if st.session_state.get("raw_pdb"):
             if pocket_on:
                 with pk2:
                     pocket_dist = st.slider("Distancia (Å)", 3.0, 8.0, 5.0, 0.5, key="pocket_dist")
-                if result["ligand"].strip():
-                    pocket_list = pocket_residues(result["cleaned"], result["ligand"], pocket_dist)
-                    st.caption(f"{len(pocket_list)} residuos a ≤ {pocket_dist:.1f} Å del ligando: " +
+                pk_opts = sorted({f"{n} {num}:{ch}" for n, num, ch in result["ligands"]})
+                if pk_opts:
+                    with pk1:
+                        pk_lig = st.selectbox("Ligando de referencia del bolsillo:", pk_opts,
+                                              key=f"pocket_lig_{pdb_name}")
+                    pk_res, pk_rest = pk_lig.split(" ", 1)
+                    pk_num, pk_chain = pk_rest.split(":")
+                    pk_pdb = extract_single_ligand(raw_pdb, pk_res, int(pk_num), pk_chain)
+                    pocket_list = pocket_residues(result["cleaned"], pk_pdb, pocket_dist)
+                    st.caption(f"{len(pocket_list)} residuos a ≤ {pocket_dist:.1f} Å de {pk_lig}: " +
                                ", ".join(f"{r['resname']}{r['resnum']}" for r in pocket_list[:25]) +
                                ("…" if len(pocket_list) > 25 else ""))
                 else:
@@ -2219,9 +2303,21 @@ if st.session_state.get("raw_pdb"):
         st.markdown("### 🚀 Docking con AutoDock Vina")
         st.caption("Ejecuta Vina dentro de la app con el receptor, el/los ligando(s) y la caja de la pestaña "
                    "anterior. Los resultados pasan directamente a la pestaña 📈.")
+        exe_path_in = ""
         if not HAS_VINA:
-            st.error("Falta el paquete de Vina: `pip install vina` (o `conda install -c conda-forge vina`).")
+            exe_path_in = st.text_input(
+                "Ruta del ejecutable de Vina (opcional)", key="vina_exe_path",
+                help="El paquete `vina` de pip solo tiene ruedas para Linux. En Windows/macOS descarga el "
+                     "ejecutable oficial de https://github.com/ccsb-scripps/AutoDock-Vina/releases "
+                     "(p. ej. vina_1.2.7_win.exe) y guárdalo junto a este script o indica aquí su ruta.")
+        vina_exe = None if HAS_VINA else find_vina_exe(exe_path_in)
+        if not HAS_VINA and not vina_exe:
+            st.error("No hay motor de Vina. Opciones: (1) `pip install vina` (solo Linux, Python ≤ 3.12), "
+                     "(2) descargar el ejecutable oficial de Vina para tu sistema "
+                     "(https://github.com/ccsb-scripps/AutoDock-Vina/releases; `vina_1.2.7_win.exe` en Windows) "
+                     "y dejarlo junto a este script, o escribir su ruta arriba. En macOS/Linux recuerda `chmod +x`.")
         else:
+            st.caption("Motor de Vina: " + ("paquete Python `vina`" if HAS_VINA else f"ejecutable `{vina_exe}`"))
             rec_stored = st.session_state.get("rec_prep")
             box_p = st.session_state.get("box_params")
             avail = {}
@@ -2248,7 +2344,10 @@ if st.session_state.get("raw_pdb"):
                            "vuelve a prepararlo en la pestaña 🧪.")
 
             if ok_rec and avail and box_p:
-                max_cpu = max(os.cpu_count() or 1, 1)
+                try:
+                    max_cpu = max(len(os.sched_getaffinity(0)), 1)    # núcleos realmente disponibles (Linux/nube)
+                except AttributeError:
+                    max_cpu = max(os.cpu_count() or 1, 1)
                 d1, d2, d3 = st.columns(3)
                 with d1:
                     scoring = st.selectbox("Función de puntuación", ["vina", "vinardo"], key="dk_sf")
@@ -2263,7 +2362,11 @@ if st.session_state.get("raw_pdb"):
                 with d5:
                     seed = st.number_input("Semilla aleatoria", 0, 999999, 42, key="dk_seed")
                 with d6:
-                    cpu = st.slider("Núcleos de CPU", 1, max_cpu, min(4, max_cpu), key="dk_cpu")
+                    if max_cpu > 1:
+                        cpu = st.slider("Núcleos de CPU", 1, max_cpu, min(4, max_cpu), key="dk_cpu")
+                    else:
+                        cpu = 1
+                        st.caption("Núcleos de CPU: 1 (es lo único disponible en este equipo)")
                 chosen = st.multiselect("Ligando(s) a acoplar:", list(avail), default=list(avail), key="dk_lig")
                 st.caption("Referencia: con exhaustividad 8 y 4 núcleos, el redocking de un ligando de 6 torsiones "
                            "en una proteína de ~5000 átomos tardó ≈ 25 s.")
@@ -2278,7 +2381,7 @@ if st.session_state.get("raw_pdb"):
                         t0 = time.time()
                         try:
                             pq, en = run_vina(rec_stored[1]["pdbqt"], d_["pdbqt"], box_p[0], box_p[1],
-                                              exh, npose, erange, seed, cpu, scoring)
+                                              exh, npose, erange, seed, cpu, scoring, exe=vina_exe)
                             out_items[d_["name"]] = {"ok": True, "pdbqt": pq, "energies": en,
                                                      "seconds": time.time() - t0, "ref_label": d_["ref_label"]}
                         except Exception as e:
@@ -2436,12 +2539,15 @@ if st.session_state.get("raw_pdb"):
                         if vals_ok:
                             top = rmsds[0]
                             bk, bv_ = min(vals_ok, key=lambda t: t[1])
-                            verdict = ("✅ redocking exitoso" if top is not None and top <= 2.0 else
-                                       "⚠️ la pose de mejor afinidad no reproduce la experimental")
-                            st.success(f"Pose 1 (mejor afinidad): RMSD = {top:.2f} Å — {verdict}. "
-                                       f"Mejor RMSD entre todas: {bv_:.2f} Å (pose {bk + 1}). "
-                                       f"Método: {rm_note}.") if top is not None else \
-                                st.info(f"Mejor RMSD entre todas: {bv_:.2f} Å (pose {bk + 1}). Método: {rm_note}.")
+                            if top is not None:
+                                verdict = ("✅ redocking exitoso" if top <= 2.0 else
+                                           "⚠️ la pose de mejor afinidad no reproduce la experimental")
+                                st.success(f"Pose 1 (mejor afinidad): RMSD = {top:.2f} Å — {verdict}. "
+                                           f"Mejor RMSD entre todas: {bv_:.2f} Å (pose {bk + 1}). "
+                                           f"Método: {rm_note}.")
+                            else:
+                                st.info(f"Mejor RMSD entre todas: {bv_:.2f} Å (pose {bk + 1}). "
+                                        f"Método: {rm_note}.")
                         else:
                             st.warning(f"No se pudo calcular el RMSD: {rm_note or 'sin correspondencia entre átomos'}. "
                                        "Comprueba que la referencia sea el mismo ligando y que el receptor "
