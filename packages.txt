@@ -1,3 +1,4 @@
+libboost-all-dev
 libopenbabel-dev
 openbabel
 swig
