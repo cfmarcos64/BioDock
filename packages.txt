@@ -1,0 +1,6 @@
+libopenbabel-dev
+openbabel
+swig
+build-essential
+cmake
+python3-dev

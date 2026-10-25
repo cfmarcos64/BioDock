@@ -1,0 +1,14 @@
+streamlit
+stmol
+py3Dmol
+biopython
+rdkit
+openbabel-wheel
+meeko
+gemmi
+plip
+pdb2pqr
+propka
+vina
+scipy
+numpy
