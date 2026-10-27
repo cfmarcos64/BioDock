@@ -1,18 +1,20 @@
 # -*- coding: utf-8 -*-
 """
 BioDock Studio: Protein Parser, Inspector & Docking Prep
-v9 — sesión PyMOL (.pse), docking con Vina integrado (paquete Python o ejecutable), RMSD de redocking,
-caja con ligando externo, bolsillo y contorno corregidos.
+v10 — v9 + descarga automática de Vina (nube/Windows), diagnóstico de PyMOL con respaldo por ejecutable,
+Ki estimada y modo de runs independientes con clústeres (estilo AutoDock4).
 """
 
 import base64
 import hashlib
 import html as html_lib
 import importlib.util
+import glob
 import io
 import json
 import math
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -1320,10 +1322,13 @@ def load_poses(filename, text, smiles=""):
         elif not scores:
             scores = [(None, None, None)] * len(mols)
 
+    cl = parse_cluster_remarks(text) if fmt == "pdbqt" else []
     poses = []
     for k, m in enumerate(mols):
         sc = scores[k] if k < len(scores) else (None, None, None)
-        poses.append({"molblock": _mol_block(m), "score": sc[0], "rmsd_lb": sc[1], "rmsd_ub": sc[2]})
+        cn, rn = cl[k] if k < len(cl) else (None, None)
+        poses.append({"molblock": _mol_block(m), "score": sc[0], "rmsd_lb": sc[1], "rmsd_ub": sc[2],
+                      "cluster_n": cn, "runs": rn})
     return poses, method, warnings
 
 
@@ -1480,7 +1485,17 @@ def render_ligand_results(results, pdb_name, prefix, kind="ext"):
 # --- BOLSILLO, SESIÓN PYMOL, RMSD Y VINA ---
 
 HAS_PYMOL = importlib.util.find_spec("pymol") is not None
-HAS_VINA = importlib.util.find_spec("vina") is not None
+
+
+def _vina_importable():
+    try:
+        from vina import Vina  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+HAS_VINA = _vina_importable()
 
 
 @st.cache_data(show_spinner=False)
@@ -1559,7 +1574,12 @@ def build_pml(items, lig_sel, complex_name="complejo.pdb", session_name="interac
                   "util.cbac sitio", "label sitio and name CA, resn+resi"]
     for k, it in enumerate(items):
         col = py_colors.get(it["tipo"], "white")
-        gname = "int_" + "".join(ch for ch in it["tipo"] if ch.isalnum())[:14]
+        gname = {"Puente de hidrógeno": "HBonds", "Contacto hidrofóbico": "Hydrophobic",
+                 "Puente salino": "SaltBridges", "Apilamiento π": "PiStacking",
+                 "Interacción π–catión": "PiCation", "Enlace de halógeno": "HalogenBonds",
+                 "Puente de agua": "WaterBridges", "Coordinación metálica": "MetalComplexes",
+                 "Contacto polar (aprox.)": "PolarContacts",
+                 "Contacto hidrofóbico (aprox.)": "HydrophobicApprox"}.get(it["tipo"], "Interactions")
         for j, (p1, p2) in enumerate(it["segs"]):
             a, b = f"ps_{k}_{j}a", f"ps_{k}_{j}b"
             lines += [f"pseudoatom {a}, pos=[{p1[0]:.3f},{p1[1]:.3f},{p1[2]:.3f}]",
@@ -1571,9 +1591,78 @@ def build_pml(items, lig_sel, complex_name="complejo.pdb", session_name="interac
     return "\n".join(lines) + "\n"
 
 
-def export_pymol_session(complex_pdb, key, items, lig_sel):
-    """(bytes, nombre de archivo, descripción). .pse real de PLIP si PyMOL está disponible; si no, ZIP con .pml."""
-    if HAS_PYMOL and HAS_PLIP:
+_PYMOL_CHECK = {}
+
+
+def pymol_module_status():
+    """(ok, mensaje): ¿se puede importar realmente el motor de PyMOL? (find_spec no basta: en Windows
+    el paquete puede estar instalado y fallar al cargar sus DLL)."""
+    if "r" in _PYMOL_CHECK:
+        return _PYMOL_CHECK["r"]
+    if importlib.util.find_spec("pymol") is None:
+        res = (False, "el módulo `pymol` no está instalado (`pip install pymol-open-source`).")
+    else:
+        try:
+            r = subprocess.run([sys.executable, "-c", "import pymol._cmd"], capture_output=True,
+                               text=True, timeout=90)
+            if r.returncode == 0:
+                res = (True, "")
+            else:
+                lines = (r.stderr or r.stdout).strip().splitlines()
+                err = lines[-1][:220] if lines else "error desconocido"
+                hint = ""
+                if "DLL" in err:
+                    hint = (" En Windows suele faltar «Microsoft Visual C++ Redistributable» (x64, 2015-2022) "
+                            "o hay una incompatibilidad con tu versión de Python; la vía más fiable es un entorno "
+                            "conda-forge (`conda install -c conda-forge pymol-open-source`).")
+                res = (False, f"el módulo `pymol` está instalado pero no carga ({err}).{hint}")
+        except Exception as e:
+            res = (False, f"no se pudo comprobar PyMOL ({str(e)[:120]}).")
+    _PYMOL_CHECK["r"] = res
+    return res
+
+
+def find_pymol_exe(custom=""):
+    """Ejecutable de PyMOL instalado (para crear el .pse con un script cuando el módulo Python no carga)."""
+    cands = []
+    if custom and custom.strip():
+        cands.append(custom.strip().strip('"'))
+    cands += ["pymol", "pymol.exe", "PyMOLWin.exe"]
+    if os.name == "nt":
+        for base in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)"),
+                     os.environ.get("LOCALAPPDATA"), os.environ.get("ProgramData")):
+            if base:
+                cands += glob.glob(os.path.join(base, "PyMOL*", "PyMOLWin.exe"))
+                cands += glob.glob(os.path.join(base, "*", "PyMOL*", "PyMOLWin.exe"))
+    for c in cands:
+        path = c if os.path.isfile(c) else shutil.which(c)
+        if path:
+            return path
+    return None
+
+
+def pymol_ui(prefix):
+    """Estado de PyMOL en la interfaz; devuelve la ruta opcional del ejecutable."""
+    ok, msg = pymol_module_status()
+    if ok:
+        st.caption("PyMOL: ✅ módulo Python operativo (la sesión .pse la crea PLIP).")
+        return ""
+    st.caption("PyMOL: ⚠️ " + msg)
+    custom = st.text_input("Ruta del ejecutable de PyMOL (opcional)", key=f"{prefix}_pymol_exe",
+                           help="Si tienes PyMOL instalado (p. ej. PyMOLWin.exe), la app lo usa para crear el .pse "
+                                "a partir de un script con las interacciones (colores y estilo propios de la app).")
+    exe = find_pymol_exe(custom)
+    st.caption(f"Ejecutable de PyMOL: {exe}" if exe else
+               "No se encontró ningún ejecutable de PyMOL: se entregará un ZIP con el script .pml.")
+    return custom
+
+
+def export_pymol_session(complex_pdb, key, items, lig_sel, pymol_exe=""):
+    """(bytes, nombre, descripción). 1) .pse real de PLIP (módulo pymol); 2) .pse creado con el ejecutable de
+    PyMOL a partir de un script; 3) ZIP con complejo + .pml."""
+    notes = []
+    mod_ok, mod_msg = pymol_module_status()
+    if mod_ok and HAS_PLIP:
         try:
             with tempfile.TemporaryDirectory() as td:
                 path = os.path.join(td, "complejo.pdb")
@@ -1585,18 +1674,40 @@ def export_pymol_session(complex_pdb, key, items, lig_sel):
                 if proc.returncode == 0 and pses:
                     with open(os.path.join(td, pses[0]), "rb") as f:
                         return f.read(), pses[0], "Sesión de PyMOL generada por PLIP (.pse)."
-                err = (proc.stderr or proc.stdout)[-300:]
+                notes.append("PLIP/PyMOL no pudo crear el .pse: " + (proc.stderr or proc.stdout).strip()[-150:])
         except Exception as e:
-            err = str(e)[:300]
-        note = f"PLIP/PyMOL no pudo crear el .pse ({err.strip()[-120:]}); se entrega un script .pml. "
-    else:
-        note = ("PyMOL no está instalado (`pip install pymol-open-source`, o `conda install -c conda-forge "
-                "pymol-open-source`); se entrega un script .pml. ")
+            notes.append(f"PLIP/PyMOL falló: {str(e)[:150]}")
+    elif not mod_ok:
+        notes.append(mod_msg[0].upper() + mod_msg[1:])
+
     pml = build_pml(items, lig_sel)
+    exe = find_pymol_exe(pymol_exe)
+    if exe:
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                with open(os.path.join(td, "complejo.pdb"), "w") as f:
+                    f.write(complex_pdb)
+                with open(os.path.join(td, "interacciones.pml"), "w") as f:
+                    f.write(pml)
+                subprocess.run([exe, "-cq", "interacciones.pml"], cwd=td, capture_output=True, text=True,
+                               timeout=300)
+                pse_path = os.path.join(td, "interacciones.pse")
+                if os.path.exists(pse_path):
+                    with open(pse_path, "rb") as f:
+                        return (f.read(), "interacciones.pse",
+                                " ".join(notes) + " Sesión creada con tu PyMOL a partir de un script con las "
+                                "interacciones de PLIP (colores y estilo propios de la app, no los de PLIP).")
+                notes.append("El ejecutable de PyMOL no generó el .pse.")
+        except Exception as e:
+            notes.append(f"Fallo al ejecutar PyMOL: {str(e)[:120]}")
+    elif mod_ok is False:
+        notes.append("No se encontró un ejecutable de PyMOL.")
+
     zbytes = zip_files({"complejo.pdb": complex_pdb, "interacciones.pml": pml,
                         "LEEME.txt": "Abre PyMOL en esta carpeta y ejecuta:  pymol interacciones.pml\n"
                                      "Se crea interacciones.pse con el complejo y las interacciones.\n"})
-    return zbytes, "interacciones_pymol.zip", note + "Ejecuta `pymol interacciones.pml` para obtener el .pse."
+    return (zbytes, "interacciones_pymol.zip",
+            " ".join(notes) + " Se entrega un ZIP: ejecuta `pymol interacciones.pml` para obtener el .pse.")
 
 
 def _skeleton(mol):
@@ -1647,17 +1758,80 @@ def ligand_rmsd(pose, ref):
         return None, "los grafos de la pose y la referencia no coinciden"
 
 
+VINA_VERSION = "1.2.7"
+
+
+def _vina_cache_dir():
+    return os.path.join(tempfile.gettempdir(), "biodock_vina")
+
+
+def vina_asset_name():
+    """Nombre del ejecutable oficial de Vina para este sistema (None si no hay)."""
+    system, mach = platform.system(), platform.machine().lower()
+    arm = mach in ("arm64", "aarch64")
+    if system == "Windows":
+        return f"vina_{VINA_VERSION}_win.exe"
+    if system == "Darwin":
+        return f"vina_{VINA_VERSION}_mac_{'aarch64' if arm else 'x86_64'}"
+    if system == "Linux":
+        return f"vina_{VINA_VERSION}_linux_{'aarch64' if arm else 'x86_64'}"
+    return None
+
+
+def download_vina_exe():
+    """Descarga el ejecutable oficial de Vina (~4 MB) desde la release de GitHub a una carpeta temporal."""
+    name = vina_asset_name()
+    if not name:
+        raise RuntimeError(f"Sistema no soportado: {platform.system()} {platform.machine()}")
+    d = _vina_cache_dir()
+    os.makedirs(d, exist_ok=True)
+    dest = os.path.join(d, name)
+    url = f"https://github.com/ccsb-scripps/AutoDock-Vina/releases/download/v{VINA_VERSION}/{name}"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    tmp = dest + ".part"
+    with urllib.request.urlopen(req, timeout=120) as r, open(tmp, "wb") as f:
+        shutil.copyfileobj(r, f)
+    os.replace(tmp, dest)
+    if os.name != "nt":
+        os.chmod(dest, 0o755)
+    out = subprocess.run([dest, "--version"], capture_output=True, text=True, timeout=30)
+    if "vina" not in (out.stdout + out.stderr).lower():
+        raise RuntimeError("El archivo descargado no es un ejecutable de Vina válido.")
+    return dest
+
+
+def _ensure_exec(path):
+    """Garantiza permiso de ejecución (en la nube un archivo subido por la web de GitHub no lo trae)."""
+    if os.name == "nt" or os.access(path, os.X_OK):
+        return path
+    try:
+        os.chmod(path, 0o755)
+        if os.access(path, os.X_OK):
+            return path
+    except OSError:
+        pass
+    try:
+        d = _vina_cache_dir()
+        os.makedirs(d, exist_ok=True)
+        dest = os.path.join(d, os.path.basename(path))
+        shutil.copy(path, dest)
+        os.chmod(dest, 0o755)
+        return dest
+    except Exception:
+        return None
+
+
 def find_vina_exe(custom=""):
-    """Localiza el ejecutable oficial de Vina: ruta indicada, junto al script/directorio actual o en el PATH."""
+    """Localiza el ejecutable oficial de Vina: ruta indicada, junto al script, carpeta de descarga o PATH."""
     cands = []
     if custom and custom.strip():
         cands.append(custom.strip().strip('"'))
-    dirs = [os.getcwd()]
+    dirs = [os.getcwd(), _vina_cache_dir()]
     try:
         dirs.append(os.path.dirname(os.path.abspath(__file__)))
     except NameError:
         pass
-    skip = (".py", ".pdbqt", ".txt", ".zip", ".md", ".log", ".pdb", ".sdf")
+    skip = (".py", ".pdbqt", ".txt", ".zip", ".md", ".log", ".pdb", ".sdf", ".part", ".toml")
     for d in dirs:
         try:
             for f in sorted(os.listdir(d)):
@@ -1670,6 +1844,9 @@ def find_vina_exe(custom=""):
     cands += ["vina", "vina.exe"]
     for c in cands:
         path = c if os.path.isfile(c) else shutil.which(c)
+        if not path:
+            continue
+        path = _ensure_exec(path)
         if not path:
             continue
         try:
@@ -1727,6 +1904,183 @@ def run_vina(receptor_pdbqt, ligand_pdbqt, center, size, exhaustiveness, n_poses
         pdbqt = v.poses(n_poses=int(n_poses), energy_range=float(energy_range))
         energies = v.energies(n_poses=int(n_poses), energy_range=float(energy_range))
     return pdbqt, [[round(float(x), 3) for x in row] for row in energies]
+
+
+
+# --- Ki ESTIMADA, RUNS INDEPENDIENTES Y CLÚSTERES (estilo AutoDock4) ---
+
+R_KCAL = 0.0019872041    # kcal/(mol·K)
+
+
+def ki_from_affinity(dg, temp=298.15):
+    """Constante de inhibición estimada (M): Ki = exp(ΔG / RT), con ΔG en kcal/mol."""
+    return math.exp(float(dg) / (R_KCAL * temp))
+
+
+def format_ki(dg, temp=298.15):
+    if dg is None:
+        return "—"
+    ki = ki_from_affinity(dg, temp)
+    if ki >= 1.0:
+        return "> 1 M"
+    for unit, f in (("mM", 1e-3), ("µM", 1e-6), ("nM", 1e-9)):
+        if ki >= f:
+            return f"{ki / f:.3g} {unit}"
+    return f"{ki / 1e-12:.3g} pM"
+
+
+_CLUSTER_RE = re.compile(r"REMARK CLUSTER\s+(\d+)\s+(\d+)")
+_AD_EL = {"A": "C", "NA": "N", "NS": "N", "OA": "O", "OS": "O", "SA": "S", "HD": "H", "HS": "H"}
+
+
+def parse_cluster_remarks(text):
+    parts = re.split(r"^MODEL", text, flags=re.M)
+    chunks = parts[1:] if len(parts) > 1 else [text]
+    out = []
+    for c in chunks:
+        m = _CLUSTER_RE.search(c)
+        out.append((int(m.group(1)), int(m.group(2))) if m else (None, None))
+    return out
+
+
+def split_pdbqt_models(text):
+    models = re.findall(r"MODEL\s+\d+\s*\n(.*?)ENDMDL", text, flags=re.S)
+    return models if models else [text]
+
+
+def _model_heavy(block):
+    """[(elemento, x, y, z)] de los átomos pesados de un bloque PDBQT."""
+    atoms = []
+    for l in block.splitlines():
+        if l.startswith(("ATOM", "HETATM")):
+            t = l.split()[-1]
+            el = _AD_EL.get(t, t.capitalize())
+            if el.startswith("H") and len(el) == 1:
+                continue
+            atoms.append((el, float(l[30:38]), float(l[38:46]), float(l[46:54])))
+    return atoms
+
+
+def rmsd_bounds(a, b):
+    """(l.b., u.b.) de la pose `a` respecto a la referencia `b`. u.b.: átomo con átomo (mismo orden);
+    l.b.: cada átomo con el átomo más cercano del mismo elemento. Ambos en Å, solo átomos pesados."""
+    import numpy as np
+    if not a or len(a) != len(b):
+        return None, None
+    A = np.array([x[1:] for x in a])
+    B = np.array([x[1:] for x in b])
+    ub = float(np.sqrt(((A - B) ** 2).sum(axis=1).mean()))
+    tot = 0.0
+    for i, (el, *_rest) in enumerate(a):
+        idx = [j for j, y in enumerate(b) if y[0] == el] or list(range(len(b)))
+        tot += float(((B[idx] - A[i]) ** 2).sum(axis=1).min())
+    return float(np.sqrt(tot / len(a))), ub
+
+
+_VINA_WORKER = r"""
+import sys
+rec, lig, out = sys.argv[1:4]
+cx, cy, cz, sx, sy, sz = [float(x) for x in sys.argv[4:10]]
+seed, scoring = int(sys.argv[10]), sys.argv[11]
+from vina import Vina
+v = Vina(sf_name=scoring, seed=seed, cpu=1, verbosity=0)
+v.set_receptor(rec)
+v.set_ligand_from_file(lig)
+v.compute_vina_maps(center=[cx, cy, cz], box_size=[sx, sy, sz])
+v.dock(exhaustiveness=1, n_poses=1)
+v.write_poses(out, n_poses=1, overwrite=True)
+"""
+
+
+def run_vina_independent(receptor_pdbqt, ligand_pdbqt, center, size, n_runs, seed, cpu, scoring,
+                         exe=None, tol=2.0, progress=None):
+    """N runs independientes (exhaustividad 1 y semillas distintas), agrupadas en clústeres por RMSD como
+    en AutoDock4. Devuelve (pdbqt con el representante de cada clúster, energías [[E, l.b., u.b.]],
+    resumen de clústeres, energías de todas las runs)."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    n_runs = max(int(n_runs), 1)
+    with tempfile.TemporaryDirectory() as td:
+        rp, lp = os.path.join(td, "receptor.pdbqt"), os.path.join(td, "ligand.pdbqt")
+        with open(rp, "w") as f:
+            f.write(receptor_pdbqt)
+        with open(lp, "w") as f:
+            f.write(ligand_pdbqt)
+
+        def one(i):
+            out = os.path.join(td, f"run_{i}.pdbqt")
+            sd = int(seed) + i
+            if exe:
+                cmd = [exe, "--receptor", rp, "--ligand", lp, "--out", out,
+                       "--center_x", f"{center[0]:.3f}", "--center_y", f"{center[1]:.3f}",
+                       "--center_z", f"{center[2]:.3f}", "--size_x", f"{size[0]:.1f}",
+                       "--size_y", f"{size[1]:.1f}", "--size_z", f"{size[2]:.1f}",
+                       "--exhaustiveness", "1", "--num_modes", "1", "--seed", str(sd), "--cpu", "1",
+                       "--scoring", scoring]
+            else:
+                cmd = [sys.executable, "-c", _VINA_WORKER, rp, lp, out] + \
+                      [f"{x:.3f}" for x in list(center) + list(size)] + [str(sd), scoring]
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+            if proc.returncode != 0 or not os.path.exists(out):
+                raise RuntimeError((proc.stderr or proc.stdout or "Vina terminó sin resultados").strip()[-300:])
+            with open(out) as f:
+                return f.read()
+
+        texts = []
+        with ThreadPoolExecutor(max_workers=max(1, min(int(cpu), n_runs))) as pool:
+            futs = [pool.submit(one, i) for i in range(n_runs)]
+            for k, fut in enumerate(as_completed(futs), 1):
+                texts.append(fut.result())
+                if progress:
+                    progress(k, n_runs)
+
+    runs = []
+    for t in texts:
+        m = _SCORE_RE.search(t)
+        blk = split_pdbqt_models(t)[0]
+        runs.append({"e": float(m.group(1)) if m else 0.0, "block": blk, "atoms": _model_heavy(blk)})
+    order = sorted(range(len(runs)), key=lambda i: runs[i]["e"])
+    clusters = []
+    for i in order:
+        for c in clusters:
+            _lb, ub = rmsd_bounds(runs[i]["atoms"], runs[c["leader"]]["atoms"])
+            if ub is not None and ub <= tol:
+                c["members"].append(i)
+                break
+        else:
+            clusters.append({"leader": i, "members": [i]})
+
+    best_atoms = runs[clusters[0]["leader"]]["atoms"]
+    models, energies, summary = [], [], []
+    for r, c in enumerate(clusters, 1):
+        ld = runs[c["leader"]]
+        lb, ub = rmsd_bounds(ld["atoms"], best_atoms)
+        lb, ub = lb or 0.0, ub or 0.0
+        head = (f"REMARK VINA RESULT: {ld['e']:10.3f} {lb:10.3f} {ub:10.3f}\n"
+                f"REMARK CLUSTER {len(c['members'])} {n_runs}\n")
+        body = re.sub(r"REMARK VINA RESULT:.*\n", head, ld["block"], count=1)
+        models.append(f"MODEL {r}\n{body.rstrip()}\nENDMDL\n")
+        energies.append([ld["e"], round(lb, 3), round(ub, 3)])
+        mem = [runs[j]["e"] for j in c["members"]]
+        summary.append({"rank": r, "best": ld["e"], "mean": sum(mem) / len(mem), "n": len(mem)})
+    return "".join(models), energies, summary, sorted(r_["e"] for r_ in runs)
+
+
+def pose_rows(poses, rmsds=None):
+    """Filas de la tabla de poses: afinidad, Ki estimada, clúster/runs y RMSD."""
+    rows = []
+    for k, p in enumerate(poses):
+        sc = p["score"]
+        cn, rn = p.get("cluster_n"), p.get("runs")
+        row = {"Pose": k + 1, "Afinidad (kcal/mol)": sc, "Ki estimada": format_ki(sc),
+               "Nº conf. en clúster": "—" if cn is None else str(cn),
+               "Runs totales": "—" if rn is None else str(rn),
+               "RMSD l.b. (vs pose 1)": p["rmsd_lb"], "RMSD u.b. (vs pose 1)": p["rmsd_ub"]}
+        if rmsds is not None:
+            v = rmsds[k] if k < len(rmsds) else None
+            row["RMSD vs cristal (Å)"] = None if v is None else round(v, 2)
+            row["≤ 2 Å"] = "✅" if v is not None and v <= 2.0 else "❌"
+        rows.append(row)
+    return rows
 
 
 # --- INTERFAZ STREAMLIT ---
@@ -1960,12 +2314,13 @@ if st.session_state.get("raw_pdb"):
                                "integrarse en la app; este PDB sirve como entrada.")
 
                     st.markdown("**Sesión de PyMOL (.pse) con las interacciones de PLIP**")
+                    pm_custom1 = pymol_ui("t1")
                     pse_key = f"pse_{pdb_name}_{sel_lig}"
                     if st.button("🧩 Generar sesión de PyMOL (.pse)", key=f"btn_{pse_key}"):
                         with st.spinner("Generando la sesión con PLIP + PyMOL..."):
                             st.session_state[pse_key] = export_pymol_session(
                                 cpx_dl, f"{i_res}:{i_chain}:{int(i_num)}", i_items,
-                                f"resn {i_res} and chain {i_chain} and resi {int(i_num)}")
+                                f"resn {i_res} and chain {i_chain} and resi {int(i_num)}", pymol_exe=pm_custom1)
                     if pse_key in st.session_state:
                         pse_data, pse_name, pse_desc = st.session_state[pse_key]
                         st.download_button(f"📥 Descargar {pse_name}", pse_data, file_name=pse_name,
@@ -2312,10 +2667,22 @@ if st.session_state.get("raw_pdb"):
                      "(p. ej. vina_1.2.7_win.exe) y guárdalo junto a este script o indica aquí su ruta.")
         vina_exe = None if HAS_VINA else find_vina_exe(exe_path_in)
         if not HAS_VINA and not vina_exe:
-            st.error("No hay motor de Vina. Opciones: (1) `pip install vina` (solo Linux, Python ≤ 3.12), "
-                     "(2) descargar el ejecutable oficial de Vina para tu sistema "
-                     "(https://github.com/ccsb-scripps/AutoDock-Vina/releases; `vina_1.2.7_win.exe` en Windows) "
-                     "y dejarlo junto a este script, o escribir su ruta arriba. En macOS/Linux recuerda `chmod +x`.")
+            st.error("No hay motor de Vina disponible aquí: el paquete `vina` de pip solo existe para Linux y "
+                     "Python ≤ 3.12, y no se encontró el ejecutable oficial.")
+            if vina_asset_name():
+                if st.button(f"⬇️ Descargar Vina {VINA_VERSION} ({vina_asset_name()}, ≈ 4 MB) desde GitHub",
+                             type="primary", key="vina_dl"):
+                    try:
+                        with st.spinner("Descargando el ejecutable oficial de Vina..."):
+                            download_vina_exe()
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"No se pudo descargar Vina: {e}")
+                st.caption("Descarga el binario oficial de la release de AutoDock-Vina (GitHub) a una carpeta "
+                           "temporal del servidor/equipo. También puedes dejarlo junto a este script o indicar su ruta arriba.")
+            else:
+                st.caption("Sistema no reconocido: descarga Vina de https://github.com/ccsb-scripps/AutoDock-Vina/releases "
+                           "e indica su ruta arriba.")
         else:
             st.caption("Motor de Vina: " + ("paquete Python `vina`" if HAS_VINA else f"ejecutable `{vina_exe}`"))
             rec_stored = st.session_state.get("rec_prep")
@@ -2348,17 +2715,38 @@ if st.session_state.get("raw_pdb"):
                     max_cpu = max(len(os.sched_getaffinity(0)), 1)    # núcleos realmente disponibles (Linux/nube)
                 except AttributeError:
                     max_cpu = max(os.cpu_count() or 1, 1)
+                search_mode = st.radio(
+                    "Modo de búsqueda:",
+                    ["Estándar de Vina (más rápido)", "Runs independientes + clústeres (estilo AutoDock4)"],
+                    horizontal=True, key="dk_mode",
+                    help="Estándar: una sola ejecución de Vina con N búsquedas internas; no informa de clústeres. "
+                         "Runs independientes: N ejecuciones con semillas distintas que se agrupan por RMSD, "
+                         "lo que da el nº de conformaciones por clúster y el nº total de runs (como AutoDock4).")
+                runs_mode = search_mode.startswith("Runs")
+                exh, npose, n_runs, tol_c, erange = 8, 9, 20, 2.0, 3.0
                 d1, d2, d3 = st.columns(3)
                 with d1:
                     scoring = st.selectbox("Función de puntuación", ["vina", "vinardo"], key="dk_sf")
                 with d2:
-                    exh = st.slider("Exhaustividad", 1, 64, 8, key="dk_exh",
-                                    help="Más alta = búsqueda más profunda y más lenta.")
+                    if runs_mode:
+                        n_runs = st.slider("Nº de runs independientes", 5, 100, 20, key="dk_runs",
+                                           help="Cada run es una búsqueda completa (exhaustividad 1) con otra semilla.")
+                    else:
+                        exh = st.slider("Exhaustividad", 1, 64, 8, key="dk_exh",
+                                        help="Más alta = búsqueda más profunda y más lenta.")
                 with d3:
-                    npose = st.slider("Nº de poses", 1, 20, 9, key="dk_np")
+                    if runs_mode:
+                        tol_c = st.slider("Tolerancia del clustering (RMSD, Å)", 0.5, 5.0, 2.0, 0.5, key="dk_tol",
+                                          help="Dos runs caen en el mismo clúster si su RMSD átomo a átomo ≤ esta tolerancia "
+                                               "(AutoDock4 usa 2,0 Å).")
+                    else:
+                        npose = st.slider("Nº de poses", 1, 20, 9, key="dk_np")
                 d4, d5, d6 = st.columns(3)
                 with d4:
-                    erange = st.slider("Rango de energía (kcal/mol)", 1.0, 10.0, 3.0, 0.5, key="dk_er")
+                    if runs_mode:
+                        st.caption("Modo runs: cada pose mostrada es el representante (menor energía) de un clúster.")
+                    else:
+                        erange = st.slider("Rango de energía (kcal/mol)", 1.0, 10.0, 3.0, 0.5, key="dk_er")
                 with d5:
                     seed = st.number_input("Semilla aleatoria", 0, 999999, 42, key="dk_seed")
                 with d6:
@@ -2368,8 +2756,12 @@ if st.session_state.get("raw_pdb"):
                         cpu = 1
                         st.caption("Núcleos de CPU: 1 (es lo único disponible en este equipo)")
                 chosen = st.multiselect("Ligando(s) a acoplar:", list(avail), default=list(avail), key="dk_lig")
-                st.caption("Referencia: con exhaustividad 8 y 4 núcleos, el redocking de un ligando de 6 torsiones "
-                           "en una proteína de ~5000 átomos tardó ≈ 25 s.")
+                if runs_mode:
+                    st.caption("Las runs se reparten entre los núcleos disponibles. Referencia (1 núcleo): ≈ 4 s por run "
+                               "para un ligando de 6 torsiones en una proteína de ~5000 átomos.")
+                else:
+                    st.caption("Referencia: con exhaustividad 8, el redocking de un ligando de 6 torsiones en una "
+                               "proteína de ~5000 átomos tardó ≈ 30 s con 1 núcleo.")
 
                 if st.button("🚀 Ejecutar docking", type="primary", use_container_width=True, key="dk_run",
                              disabled=not chosen):
@@ -2380,29 +2772,46 @@ if st.session_state.get("raw_pdb"):
                         bar.progress(k / len(chosen), text=f"Acoplando {d_['name']} ({k + 1}/{len(chosen)})...")
                         t0 = time.time()
                         try:
-                            pq, en = run_vina(rec_stored[1]["pdbqt"], d_["pdbqt"], box_p[0], box_p[1],
-                                              exh, npose, erange, seed, cpu, scoring, exe=vina_exe)
-                            out_items[d_["name"]] = {"ok": True, "pdbqt": pq, "energies": en,
-                                                     "seconds": time.time() - t0, "ref_label": d_["ref_label"]}
+                            if runs_mode:
+                                def _prog(done, total, _k=k, _n=len(chosen), _nm=d_["name"]):
+                                    bar.progress((_k + done / total) / _n, text=f"Acoplando {_nm}: run {done}/{total}")
+                                pq, en, clus, run_e = run_vina_independent(
+                                    rec_stored[1]["pdbqt"], d_["pdbqt"], box_p[0], box_p[1], n_runs, seed, cpu,
+                                    scoring, exe=vina_exe, tol=tol_c, progress=_prog)
+                                out_items[d_["name"]] = {"ok": True, "pdbqt": pq, "energies": en,
+                                                         "seconds": time.time() - t0, "ref_label": d_["ref_label"],
+                                                         "mode": "runs", "runs": n_runs, "clusters": clus,
+                                                         "run_energies": run_e}
+                            else:
+                                pq, en = run_vina(rec_stored[1]["pdbqt"], d_["pdbqt"], box_p[0], box_p[1],
+                                                  exh, npose, erange, seed, cpu, scoring, exe=vina_exe)
+                                out_items[d_["name"]] = {"ok": True, "pdbqt": pq, "energies": en,
+                                                         "seconds": time.time() - t0, "ref_label": d_["ref_label"],
+                                                         "mode": "standard"}
                         except Exception as e:
                             out_items[d_["name"]] = {"ok": False, "error": str(e)[:300]}
                     bar.progress(1.0, text="Docking completado")
-                    st.session_state["dock_results"] = {
-                        "items": out_items, "pdb_name": pdb_name,
-                        "params": f"{scoring} · exhaustividad {exh} · {npose} poses · semilla {seed}"}
+                    params_txt = (f"{scoring} · {n_runs} runs independientes · clústeres a {tol_c} Å · semilla {seed}"
+                                  if runs_mode else
+                                  f"{scoring} · exhaustividad {exh} · {npose} poses · semilla {seed}")
+                    st.session_state["dock_results"] = {"items": out_items, "pdb_name": pdb_name,
+                                                        "params": params_txt}
 
             dock_store = st.session_state.get("dock_results")
             if dock_store:
                 st.markdown("---")
                 st.markdown("#### Resultados")
                 st.caption(f"Parámetros: {dock_store['params']}")
-                rows, rmsd_by_lig = [], {}
+                rows, rmsd_by_lig, poses_by_lig = [], {}, {}
                 for nm, it_ in dock_store["items"].items():
                     if not it_.get("ok"):
-                        rows.append({"Ligando": nm, "Mejor afinidad (kcal/mol)": None, "Poses": 0,
-                                     "Tiempo (s)": None, "RMSD mejor pose (Å)": None,
-                                     "Estado": "❌ " + it_.get("error", "")})
+                        st.error(f"❌ {nm}: {it_.get('error', 'error desconocido')}")
+                        rows.append({"Ligando": nm, "Modo": None, "Mejor afinidad (kcal/mol)": None,
+                                     "Ki estimada": None, "Poses": 0, "Tiempo (s)": None,
+                                     "RMSD mejor pose (Å)": None, "Estado": "❌ error"})
                         continue
+                    poses_d, _, _ = load_poses("out.pdbqt", it_["pdbqt"], "")
+                    poses_by_lig[nm] = poses_d
                     best_rmsd = best_any = None
                     if it_["ref_label"] and HAS_RDKIT:
                         try:
@@ -2410,16 +2819,16 @@ if st.session_state.get("raw_pdb"):
                             rn2, rc2 = rrest_.split(":")
                             ref_m = ligand_mol_for_map(extract_single_ligand(raw_pdb, rr_, int(rn2), rc2),
                                                        ensure_smiles(pdb_name, it_["ref_label"], rr_))
-                            poses_d, _, _ = load_poses("out.pdbqt", it_["pdbqt"], "")
                             vals = [ligand_rmsd(pose_mol(p_["molblock"]), ref_m)[0] for p_ in poses_d]
                             rmsd_by_lig[nm] = vals
                             best_rmsd = vals[0] if vals and vals[0] is not None else None
                             best_any = min([v for v in vals if v is not None], default=None)
                         except Exception:
                             pass
-                    rows.append({"Ligando": nm,
-                                 "Mejor afinidad (kcal/mol)": it_["energies"][0][0] if it_["energies"] else None,
-                                 "Poses": len(it_["energies"]), "Tiempo (s)": round(it_["seconds"], 1),
+                    best_sc = poses_d[0]["score"] if poses_d else (it_["energies"][0][0] if it_["energies"] else None)
+                    rows.append({"Ligando": nm, "Modo": "runs + clústeres" if it_.get("mode") == "runs" else "estándar",
+                                 "Mejor afinidad (kcal/mol)": best_sc, "Ki estimada": format_ki(best_sc),
+                                 "Poses": len(poses_d), "Tiempo (s)": round(it_["seconds"], 1),
                                  "RMSD mejor pose (Å)": None if best_rmsd is None else round(best_rmsd, 2),
                                  "Mejor RMSD de todas (Å)": None if best_any is None else round(best_any, 2),
                                  "Estado": "✅" if best_rmsd is None or best_rmsd <= 2.0 else "⚠️ > 2 Å"})
@@ -2431,13 +2840,32 @@ if st.session_state.get("raw_pdb"):
                 if good:
                     pick = st.selectbox("Ver poses de:", list(good), key="dk_pick")
                     it_ = good[pick]
-                    vals = rmsd_by_lig.get(pick)
-                    st.dataframe([{"Pose": k + 1, "Afinidad (kcal/mol)": e[0],
-                                   **({"RMSD vs cristal (Å)": None if vals[k] is None else round(vals[k], 2),
-                                       "≤ 2 Å": "✅" if vals[k] is not None and vals[k] <= 2.0 else "❌"}
-                                      if vals and k < len(vals) else {})}
-                                  for k, e in enumerate(it_["energies"])],
+                    st.dataframe(pose_rows(poses_by_lig[pick], rmsd_by_lig.get(pick)),
                                  hide_index=True, use_container_width=True)
+                    st.caption(
+                        "**Ki estimada** = exp(ΔG/RT) con ΔG = afinidad de Vina y T = 298,15 K. Es una estimación "
+                        "orientativa: la puntuación de Vina no es un ΔG calibrado, así que úsala para comparar ligandos, "
+                        "no como valor absoluto. · **RMSD l.b. / u.b. (vs pose 1)**: distancia en Å (átomos pesados) entre "
+                        "cada pose y la MEJOR pose de esta misma ejecución (la pose 1 vale 0), no frente al cristal. "
+                        "u.b. (cota superior) empareja cada átomo con su homólogo exacto; l.b. (cota inferior) lo empareja "
+                        "con el átomo más cercano del mismo elemento, por eso l.b. ≤ u.b.; la diferencia revela simetría "
+                        "o grupos intercambiables. Si ambos son pequeños, son la misma pose; si l.b. es bajo y u.b. alto, "
+                        "es casi la misma pose con átomos equivalentes permutados. · **RMSD vs cristal**: frente al "
+                        "ligando experimental (redocking).")
+                    if it_.get("mode") == "runs":
+                        with st.expander("📊 Histograma de clústeres (estilo AutoDock4)", expanded=True):
+                            st.dataframe([{"Rango": c_["rank"], "Menor energía (kcal/mol)": round(c_["best"], 3),
+                                           "Energía media del clúster": round(c_["mean"], 3),
+                                           "Nº conformaciones en el clúster": c_["n"],
+                                           "Runs totales": it_["runs"]} for c_ in it_["clusters"]],
+                                         hide_index=True, use_container_width=True)
+                            st.caption("Cada run es una búsqueda independiente; se ordenan por energía y cada una se "
+                                       "asigna al primer clúster cuyo representante esté a ≤ la tolerancia (RMSD "
+                                       "átomo a átomo). Un clúster muy poblado indica una pose reproducible; uno con "
+                                       "pocas conformaciones puede ser un mínimo poco fiable.")
+                    elif not any(p_.get("cluster_n") for p_ in poses_by_lig[pick]):
+                        st.caption("Modo estándar: Vina no informa de clústeres ni de runs. Usa «Runs independientes + "
+                                   "clústeres» para obtener esas columnas.")
                     q1, q2 = st.columns(2)
                     with q1:
                         st.download_button("📥 Poses de este ligando (.pdbqt)", it_["pdbqt"].encode(),
@@ -2525,15 +2953,13 @@ if st.session_state.get("raw_pdb"):
                                     rmsds[k_], rm_note = ligand_rmsd(pose_mol(p_["molblock"]), ref_mol_res)
                                 except Exception as e:
                                     rm_note = str(e)[:80]
-                    rows5 = []
-                    for k, p in enumerate(poses):
-                        row = {"Pose": k + 1, "Afinidad (kcal/mol)": p["score"],
-                               "RMSD l.b.": p["rmsd_lb"], "RMSD u.b.": p["rmsd_ub"]}
-                        if ref_choice != "Ninguno":
-                            row["RMSD vs cristal (Å)"] = None if rmsds[k] is None else round(rmsds[k], 2)
-                            row["≤ 2 Å"] = "✅" if rmsds[k] is not None and rmsds[k] <= 2.0 else "❌"
-                        rows5.append(row)
+                    rows5 = pose_rows(poses, rmsds if ref_choice != "Ninguno" else None)
                     st.dataframe(rows5, hide_index=True, use_container_width=True)
+                    st.caption("**RMSD l.b. / u.b. (vs pose 1)**: distancia entre cada pose y la mejor pose del archivo "
+                               "(no frente al cristal): u.b. empareja cada átomo con su homólogo; l.b. con el átomo más "
+                               "cercano del mismo elemento (l.b. ≤ u.b.). **Ki estimada** = exp(ΔG/RT), T = 298,15 K "
+                               "(orientativa). **Nº conf. en clúster / Runs totales**: solo en resultados generados "
+                               "con el modo «Runs independientes».")
                     if ref_choice != "Ninguno":
                         vals_ok = [(k, v) for k, v in enumerate(rmsds) if v is not None]
                         if vals_ok:
@@ -2616,11 +3042,12 @@ if st.session_state.get("raw_pdb"):
                                            file_name=f"complejo_pose_{pose_idx + 1}.pdb",
                                            use_container_width=True, key="res_dl_cpx")
 
+                    pm_custom5 = pymol_ui("t5")
                     pse5 = f"res_pse_{pose_idx}_{hashlib.md5(cpx.encode()).hexdigest()[:8]}"
                     if st.button("🧩 Generar sesión de PyMOL (.pse) de esta pose", key=f"btn_{pse5}"):
                         with st.spinner("Generando la sesión con PLIP + PyMOL..."):
                             st.session_state[pse5] = export_pymol_session(
-                                cpx, "LIG:Z:1", p_items, "resn LIG and chain Z and resi 1")
+                                cpx, "LIG:Z:1", p_items, "resn LIG and chain Z and resi 1", pymol_exe=pm_custom5)
                     if pse5 in st.session_state:
                         pse_d, pse_n, pse_ds = st.session_state[pse5]
                         st.download_button(f"📥 Descargar {pse_n}", pse_d, file_name=f"pose_{pose_idx + 1}_{pse_n}",
@@ -2645,6 +3072,7 @@ if st.session_state.get("raw_pdb"):
                                 per_pose.append((lab, it_k))
                                 cnt = Counter_types(it_k)
                                 row_s = {"Pose": k + 1, "Afinidad (kcal/mol)": poses[k]["score"],
+                                         "Ki estimada": format_ki(poses[k]["score"]),
                                          "Nº interacciones": len(it_k), **cnt}
                                 if ref_choice != "Ninguno" and rmsds[k] is not None:
                                     row_s["RMSD vs cristal (Å)"] = round(rmsds[k], 2)
