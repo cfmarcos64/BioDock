@@ -1,8 +1,14 @@
 # -*- coding: utf-8 -*-
 """
+Created on Wed Oct 28 13:15:12 2026
+
+@author: Carlos Fernandez
+"""
+
+"""
 BioDock Studio: Protein Parser, Inspector & Docking Prep
-v10 — v9 + descarga automática de Vina (nube/Windows), diagnóstico de PyMOL con respaldo por ejecutable,
-Ki estimada y modo de runs independientes con clústeres (estilo AutoDock4).
+v11 — v10 + exportación a GROMACS (topologías proteína/ligando, .mdp, script del flujo completo y
+construcción/validación opcional del sistema si GROMACS está instalado).
 """
 
 import base64
@@ -67,7 +73,7 @@ st.markdown(
     """
 <style>
 :root { --bg:#000000; --panel:#0a0c10; --border:#1e2430; --accent:#19e3c5;
-        --accent2:#4d7cff; --text:#e8eaed; --muted:#8b93a1; }
+        --accent2:#4d7cff; --text:#e8eaed; --muted:#c0c7d0; }
 
 html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"],
 [data-testid="stToolbar"], [data-testid="stSidebar"] { background-color: var(--bg) !important; color: var(--text); }
@@ -144,6 +150,36 @@ def fetch_pdb_from_web(pdb_code):
             return response.read().decode('utf-8', errors='ignore')
     except Exception:
         return None
+    
+
+def extract_molecule_name(pdb_text, default_code="PROTEIN"):
+    """
+    Busca en el texto del PDB las líneas COMPND y extrae el valor del campo MOLECULE.
+    Ejemplo: COMPND   2 MOLECULE: HIV-1 PROTEASE; -> 'HIV-1 PROTEASE'
+    """
+    if not pdb_text:
+        return default_code.upper()
+    
+    # Buscar el patrón MOLECULE: <nombre>; dentro de los registros COMPND
+    match = re.search(r"COMPND(?:\s+\d+)?\s+MOLECULE:\s*([^;\n]+);?", pdb_text, re.IGNORECASE)
+    if match:
+        # Limpiar espacios extra y comillas si las hubiera
+        name = match.group(1).strip().strip('"\'')
+        return name
+    
+    return default_code.upper()
+
+
+def get_structure_heterogens(pdb_text):
+    """Escanea el PDB y devuelve una lista ordenada de nombres de residuos no estándar (HETATM que no son agua)."""
+    structure = PDB.PDBParser(QUIET=True).get_structure("het", io.StringIO(pdb_text))
+    hets = set()
+    for model in structure:
+        for chain in model:
+            for res in chain:
+                if not is_water(res) and not is_amino_acid(res):
+                    hets.add(res.get_resname().strip())
+    return sorted(list(hets))
 
 
 def is_water(res):
@@ -158,7 +194,10 @@ def is_ion(res):
     return res.get_resname().strip() in COMMON_IONS and not is_amino_acid(res)
 
 
-def is_ligand(res):
+def is_ligand(res, cofactors=()):
+    resname = res.get_resname().strip()
+    if resname in cofactors:
+        return False
     return (not is_water(res)) and (not is_ion(res)) and (not is_amino_acid(res)) \
         and res.get_id()[0].startswith('H_')
 
@@ -251,8 +290,9 @@ def get_chain_summary(pdb_text):
 
 
 @st.cache_data(show_spinner=False)
-def process_pdb_structure(pdb_text, selected_chains, remove_water, remove_ions):
+def process_pdb_structure(pdb_text, selected_chains, remove_water, remove_ions, retained_heterogens=()):
     selected = set(selected_chains)
+    retained_set = set(retained_heterogens)
     structure = PDB.PDBParser(QUIET=True).get_structure("protein_structure", io.StringIO(pdb_text))
     model = next(iter(structure))
     model_id = model.id
@@ -273,16 +313,21 @@ def process_pdb_structure(pdb_text, selected_chains, remove_water, remove_ions):
             continue
         residues = []
         for res in chain:
+            resname = res.get_resname().strip()
             if is_water(res):
                 water_count += 1
             elif is_amino_acid(res):
                 num = res.get_id()[1]
-                residues.append((AA_3TO1[res.get_resname().strip()], num,
+                residues.append((AA_3TO1[resname], num,
                                  residue_ss(segments, chain.id, num)))
             elif is_ion(res):
                 ion_count += 1
-            elif is_ligand(res):
-                ligands.append((res.get_resname().strip(), res.get_id()[1], chain.id))
+            
+            # Si el residuo está en la lista de retenidos, se queda en la proteína
+            if resname in retained_set:
+                pass
+            elif is_ligand(res, retained_set):
+                ligands.append((resname, res.get_id()[1], chain.id))
         if residues:
             chains_data[chain.id] = residues
 
@@ -294,8 +339,11 @@ def process_pdb_structure(pdb_text, selected_chains, remove_water, remove_ions):
             return chain.id in selected
 
         def accept_residue(self, residue):
+            resname = residue.get_resname().strip()
             if is_amino_acid(residue):
                 return True
+            if resname in retained_set:
+                return True  # <-- Conserva cofactores e iones específicos aunque se filtren los demás
             if not remove_water and is_water(residue):
                 return True
             if not remove_ions and is_ion(residue):
@@ -310,8 +358,12 @@ def process_pdb_structure(pdb_text, selected_chains, remove_water, remove_ions):
             return chain.id in selected
 
         def accept_residue(self, residue):
-            return is_ligand(residue)
+            resname = residue.get_resname().strip()
+            if resname in retained_set:
+                return False  # <-- Evita que los retenidos se extraigan como ligandos móviles
+            return is_ligand(residue, retained_set)
 
+    
     writer = PDB.PDBIO()
     writer.set_structure(structure)
 
@@ -426,7 +478,7 @@ def simple_color(mode, rmin, rmax):
 
 
 def build_3dmol_view(pdb_str, ligand_str, style_type, color_mode, show_protein, show_ligand,
-                     rmin, rmax, surf_opacity, show_pocket, outline, spin, inter=None):
+                     rmin, rmax, surf_opacity, show_pocket, outline, spin, inter=None, cofactors=()):
     view = py3Dmol.view(width=700, height=560)
     view.setBackgroundColor('#000000')
     if outline:
@@ -462,6 +514,12 @@ def build_3dmol_view(pdb_str, ligand_str, style_type, color_mode, show_protein, 
                       {'sphere': {'radius': 0.3, 'color': '#ff4b5c'}})
         view.addStyle({'model': prot_idx, 'resn': sorted(COMMON_IONS)},
                       {'sphere': {'radius': 0.6, 'colorscheme': 'Jmol'}})
+        
+        # ESTILO PARA LOS COFACTORES CONSERVADOS (Sticks) ---
+        if cofactors:
+            view.addStyle({'model': prot_idx, 'resn': list(cofactors)},
+                          {'stick': {'colorscheme': 'yellowCarbon', 'radius': 0.18},
+                           'sphere': {'colorscheme': 'yellowCarbon', 'scale': 0.25}})
 
         if style_type == "Superficie + Cartoon":
             if color_mode == "Por cadena":
@@ -1388,11 +1446,17 @@ def analyze_complex(complex_pdb, resname, resnum, chain_id):
         return [], "", f"No se pudieron calcular las interacciones: {e}"
 
 
-def build_pose_view(protein_pdb, mol, items, labels=True, ref_ligand_pdb=""):
+def build_pose_view(protein_pdb, mol, items, labels=True, ref_ligand_pdb="", cofactors=()):
     view = py3Dmol.view(width=700, height=560)
     view.setBackgroundColor('#000000')
     view.addModel(protein_pdb, "pdb")
     view.setStyle({'model': 0}, {'cartoon': {'color': '#9aa0aa', 'opacity': 0.85}})
+    
+    # PINTAR COFACTORES EN STICKS EN LA VISTA DE POSES
+    if cofactors:
+        view.addStyle({'model': 0, 'resn': list(cofactors)},
+                      {'stick': {'colorscheme': 'yellowCarbon', 'radius': 0.20}})
+        
     heavy = heavy_atoms(mol)
     view.addModel(Chem.MolToMolBlock(heavy, kekulize=False), "sdf")
     view.setStyle({'model': 1}, {'stick': {'colorscheme': 'magentaCarbon', 'radius': 0.25}})
@@ -2083,6 +2147,484 @@ def pose_rows(poses, rmsds=None):
     return rows
 
 
+
+# --- EXPORTACIÓN A GROMACS ---
+
+# Este código viaja tal cual dentro del paquete (prepare_system.py): la app y el script del usuario usan la misma lógica.
+_GMX_HELPERS = r"""
+import re
+import sys
+
+
+def amberize_pdb(pdb_text):
+    '''Renombra residuos según los H presentes (salida de PDB2PQR/PROPKA) con la nomenclatura AMBER de GROMACS.'''
+    res_atoms = {}
+    for l in pdb_text.splitlines():
+        if l.startswith(("ATOM", "HETATM")):
+            key = (l[21], l[22:27])
+            res_atoms.setdefault(key, (l[17:20].strip(), set()))[1].add(l[12:16].strip())
+    new_name, changes = {}, {}
+    for key, (rn, atoms) in res_atoms.items():
+        nn = rn
+        if rn == "HIS":
+            hd, he = "HD1" in atoms, "HE2" in atoms
+            nn = "HIP" if hd and he else "HID" if hd else "HIE" if he else "HIS"
+        elif rn == "ASP" and "HD2" in atoms:
+            nn = "ASH"
+        elif rn == "GLU" and "HE2" in atoms:
+            nn = "GLH"
+        elif rn == "LYS" and {"HZ1", "HZ2"} <= atoms and "HZ3" not in atoms:
+            nn = "LYN"
+        if nn != rn:
+            new_name[key] = nn
+            changes[nn] = changes.get(nn, 0) + 1
+    out = []
+    for l in pdb_text.splitlines():
+        if l.startswith(("ATOM", "HETATM")):
+            key = (l[21], l[22:27])
+            if key in new_name:
+                l = l[:17] + f"{new_name[key]:>3s}" + l[20:]
+        out.append(l)
+    return "\n".join(out) + "\n", changes
+
+
+def parse_gro(text):
+    lines = text.rstrip("\n").splitlines()
+    n = int(lines[1].strip())
+    return lines[0], lines[2:2 + n], lines[2 + n]
+
+
+def merge_gro(protein_gro, ligand_gro, lig_resname="LIG"):
+    '''Une las coordenadas del ligando a las de la proteína (caja de la proteína) y renumera los átomos.'''
+    t1, a1, box1 = parse_gro(protein_gro)
+    _t2, a2, _box2 = parse_gro(ligand_gro)
+    last_res = int(a1[-1][:5]) if a1 else 0
+    out, serial = [], 0
+    for l in a1:
+        serial += 1
+        out.append(l[:15] + f"{serial % 100000:5d}" + l[20:])
+    for l in a2:
+        serial += 1
+        out.append(f"{(last_res + 1) % 100000:5d}{lig_resname:<5s}{l[10:15]}{serial % 100000:5d}{l[20:]}")
+    return f"{t1}\n{len(out):5d}\n" + "\n".join(out) + f"\n{box1}\n"
+
+
+def normalize_ligand_itp(itp_text, lig_resname="LIG", posre_name="posre_LIG.itp"):
+    '''Residuo del ligando -> LIG y restricciones de posición bajo -DPOSRES (idempotente).'''
+    out, in_atoms = [], False
+    for l in itp_text.splitlines():
+        s = l.strip()
+        if s.startswith("["):
+            in_atoms = s.replace(" ", "").lower().startswith("[atoms]")
+        elif in_atoms and s and not s.startswith(";"):
+            p = l.split()
+            if len(p) >= 8 and p[0].isdigit():
+                l = re.sub(r"^(\s*\d+\s+\S+\s+\d+\s+)(\S+)", lambda m: m.group(1) + lig_resname, l, count=1)
+        out.append(l)
+    text = "\n".join(out)
+    if f'#include "{posre_name}"' not in text:
+        text += ("\n\n; Restricciones de posición del ligando (átomos pesados)\n#ifdef POSRES\n"
+                 f'#include "{posre_name}"\n#endif\n')
+    return text if text.endswith("\n") else text + "\n"
+
+
+def patch_topology(top_text, itp_name="LIG_GMX.itp", mol_name="LIG"):
+    '''Incluye el itp del ligando tras el campo de fuerzas y añade el ligando a [ molecules ] (idempotente).'''
+    text = top_text
+    if f'#include "{itp_name}"' not in text:
+        out, inserted = [], False
+        for l in text.splitlines():
+            out.append(l)
+            if not inserted and "forcefield.itp" in l and l.strip().startswith("#include"):
+                out += ["", "; Topología del ligando (GAFF/GAFF2, generada con acpype)", f'#include "{itp_name}"']
+                inserted = True
+        if not inserted:
+            raise ValueError("No se encontró el #include del campo de fuerzas en topol.top")
+        text = "\n".join(out) + "\n"
+    if not re.search(rf"^\s*{mol_name}\s+1\s*$", text, flags=re.M):
+        text = text.rstrip("\n") + f"\n{mol_name:<18s}1\n"
+    return text
+
+
+def main(argv):
+    if len(argv) >= 6 and argv[0] == "merge":
+        _, pro_gro, lig_gro, top, lig_itp, out_gro = argv[:6]
+        pg, lg = open(pro_gro).read(), open(lig_gro).read()
+        top_t, itp_t = open(top).read(), open(lig_itp).read()
+        open(out_gro, "w").write(merge_gro(pg, lg))
+        open(lig_itp, "w").write(normalize_ligand_itp(itp_t))
+        open(top, "w").write(patch_topology(top_t))
+        print("Complejo escrito en", out_gro)
+    else:
+        print("Uso: python3 prepare_system.py merge proteina.gro ligando.gro topol.top LIG_GMX.itp complejo.gro")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
+"""
+
+_GMX_NS = {"__name__": "gmx_helpers"}
+exec(_GMX_HELPERS, _GMX_NS)
+amberize_pdb = _GMX_NS["amberize_pdb"]
+merge_gro = _GMX_NS["merge_gro"]
+normalize_ligand_itp = _GMX_NS["normalize_ligand_itp"]
+patch_topology = _GMX_NS["patch_topology"]
+
+GMX_AMBER_FFS = ["amber99sb-ildn", "amber99sb", "amber03", "amber99", "amber96", "amber94"]
+GMX_WATERS = {"tip3p": "spc216.gro", "spce": "spc216.gro", "tip4p": "tip4p.gro", "tip4pew": "tip4p.gro"}
+
+
+def mdp_files(temp=300.0, pres=1.0, dt=0.002, em_steps=5000, nvt_ps=100.0, npt_ps=100.0, prod_ns=10.0,
+              out_ps=10.0, grp="Protein_LIG", rc=1.0):
+    """Parámetros .mdp de todas las fases (dt en ps; tiempos en ps/ns)."""
+    common = f"""; Interacciones no enlazantes (PME + Verlet)
+cutoff-scheme            = Verlet
+nstlist                  = 20
+coulombtype              = PME
+rcoulomb                 = {rc:g}
+pme_order                = 4
+fourierspacing           = 0.16
+vdwtype                  = Cut-off
+vdw-modifier             = Potential-shift
+rvdw                     = {rc:g}
+DispCorr                 = EnerPres
+pbc                      = xyz
+"""
+    constr = """; Restricciones
+constraints              = h-bonds
+constraint_algorithm     = lincs
+lincs_iter               = 1
+lincs_order              = 4
+"""
+    tc = f"""; Termostato
+tcoupl                   = V-rescale
+tc-grps                  = {grp} Water_and_ions
+tau_t                    = 0.1     0.1
+ref_t                    = {temp:g}   {temp:g}
+"""
+
+    def steps(ps):
+        return max(int(round(ps / dt)), 1)
+
+    return {
+        "ions.mdp": f"""; Solo para generar el .tpr que usa genion
+integrator               = steep
+emtol                    = 1000.0
+emstep                   = 0.01
+nsteps                   = 50000
+{common}""",
+        "em.mdp": f"""; Minimización de energía (máxima pendiente)
+integrator               = steep
+emtol                    = 1000.0
+emstep                   = 0.01
+nsteps                   = {int(em_steps)}
+nstenergy                = 500
+nstlog                   = 500
+{common}""",
+        "nvt.mdp": f"""; Equilibración NVT con restricciones de posición (proteína + ligando)
+define                   = -DPOSRES
+integrator               = md
+dt                       = {dt:g}
+nsteps                   = {steps(nvt_ps)}
+nstenergy                = 500
+nstlog                   = 500
+continuation             = no
+{constr}{common}{tc}pcoupl                   = no
+gen_vel                  = yes
+gen_temp                 = {temp:g}
+gen_seed                 = -1
+""",
+        "npt.mdp": f"""; Equilibración NPT con restricciones de posición (C-rescale, requiere GROMACS >= 2021)
+define                   = -DPOSRES
+integrator               = md
+dt                       = {dt:g}
+nsteps                   = {steps(npt_ps)}
+nstenergy                = 500
+nstlog                   = 500
+continuation             = yes
+{constr}{common}{tc}pcoupl                   = C-rescale
+pcoupltype               = isotropic
+tau_p                    = 2.0
+ref_p                    = {pres:g}
+compressibility          = 4.5e-5
+refcoord_scaling         = com
+gen_vel                  = no
+""",
+        "md.mdp": f"""; Producción (sin restricciones)
+integrator               = md
+dt                       = {dt:g}
+nsteps                   = {steps(prod_ns * 1000.0)}
+nstenergy                = 5000
+nstlog                   = 5000
+nstxout-compressed       = {steps(out_ps)}
+compressed-x-grps        = System
+continuation             = yes
+{constr}{common}{tc}pcoupl                   = Parrinello-Rahman
+pcoupltype               = isotropic
+tau_p                    = 2.0
+ref_p                    = {pres:g}
+compressibility          = 4.5e-5
+gen_vel                  = no
+""",
+    }
+
+
+def find_gmx():
+    for name in ("gmx", "gmx_mpi", "gmx.exe"):
+        path = shutil.which(name)
+        if path:
+            try:
+                r = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=30)
+                m = re.search(r"GROMACS version:\s*(\S+)", r.stdout + r.stderr)
+                if m:
+                    return path, m.group(1)
+            except Exception:
+                continue
+    return None, None
+
+
+def gmx_tools_status():
+    gmx, ver = find_gmx()
+    return {"gmx": gmx, "gmx_version": ver, "acpype": shutil.which("acpype"),
+            "antechamber": shutil.which("antechamber"), "sqm": shutil.which("sqm")}
+
+
+def mol_to_mol2_sdf(mol):
+    """Molécula RDKit con H -> (mol2, sdf, carga neta) mediante Open Babel."""
+    molblock = Chem.MolToMolBlock(mol)
+    ob = pybel.readstring("mol", molblock)
+    net = int(sum(a.formalcharge for a in ob.atoms))
+    return ob.write("mol2"), ob.write("sdf"), net, len(ob.atoms)
+
+
+def ligand_gromacs_params(mol2_text, net_charge, gaff="gaff2", charges="bcc"):
+    """Parametriza el ligando con acpype (GAFF/GAFF2). Devuelve {archivo: texto} listo para GROMACS."""
+    if not shutil.which("acpype") or not shutil.which("antechamber"):
+        raise RuntimeError("Hacen falta acpype y AmberTools (antechamber/sqm).")
+    with tempfile.TemporaryDirectory() as td:
+        with open(os.path.join(td, "LIG.mol2"), "w") as f:
+            f.write(mol2_text)
+        proc = subprocess.run(["acpype", "-i", "LIG.mol2", "-b", "LIG", "-n", str(int(net_charge)),
+                               "-a", gaff, "-c", charges], cwd=td, capture_output=True, text=True, timeout=3600)
+        out_dir = os.path.join(td, "LIG.acpype")
+        need = ("LIG_GMX.itp", "LIG_GMX.gro", "posre_LIG.itp")
+        if proc.returncode != 0 or not all(os.path.exists(os.path.join(out_dir, n)) for n in need):
+            raise RuntimeError("acpype falló: " + (proc.stdout + proc.stderr).strip()[-400:])
+        files = {n: open(os.path.join(out_dir, n)).read() for n in need}
+    files["LIG_GMX.itp"] = normalize_ligand_itp(files["LIG_GMX.itp"])
+    return files
+
+
+_GMX_SCRIPT = r"""#!/usr/bin/env bash
+# Flujo GROMACS generado por BioDock Studio. Es reanudable: omite los pasos cuyo resultado ya existe.
+#   Uso:  bash run_gromacs.sh            (o: GMX=gmx_mpi MDRUN_OPTS="-nb gpu -pme gpu" bash run_gromacs.sh)
+set -euo pipefail
+GMX="${GMX:-gmx}"
+MDRUN_OPTS="${MDRUN_OPTS:-}"
+export GMX_MAXBACKUP=-1
+
+@@LIGAND_PARAMS@@
+echo "==> 1/8 Topología de la proteína (@@FF@@ + @@WATER@@)"
+[ -f protein.gro ] || $GMX pdb2gmx -f protein_amber.pdb -o protein.gro -p topol.top -i posre.itp -ff @@FF@@ -water @@WATER@@ -ignh
+
+echo "==> 2/8 Complejo proteína + ligando"
+[ -f complex.gro ] || @@MERGE@@
+
+echo "==> 3/8 Caja (@@BOX@@, @@DIST@@ nm) y solvatación"
+[ -f newbox.gro ] || $GMX editconf -f complex.gro -o newbox.gro -c -d @@DIST@@ -bt @@BOX@@
+[ -f solv.gro ] || $GMX solvate -cp newbox.gro -cs @@SOLVENT@@ -p topol.top -o solv.gro
+
+echo "==> 4/8 Iones: neutralización + @@CONC@@ M NaCl"
+if [ ! -f solv_ions.gro ]; then
+  # -maxwarn 1: el único aviso esperado es «sistema con carga neta», que genion corrige a continuación
+  $GMX grompp -f mdp/ions.mdp -c solv.gro -p topol.top -o ions.tpr -maxwarn 1
+  echo SOL | $GMX genion -s ions.tpr -o solv_ions.gro -p topol.top -pname NA -nname CL -neutral -conc @@CONC@@
+fi
+
+echo "==> 5/8 Minimización de energía"
+[ -f em.gro ] || { $GMX grompp -f mdp/em.mdp -c solv_ions.gro -p topol.top -o em.tpr; $GMX mdrun -v -deffnm em $MDRUN_OPTS; }
+
+echo "==> 6/8 Grupos de índice"
+[ -f index.ndx ] || @@INDEX@@
+
+echo "==> 7/8 Equilibración NVT y NPT (con restricciones de posición)"
+[ -f nvt.gro ] || { $GMX grompp -f mdp/nvt.mdp -c em.gro -r em.gro -p topol.top -n index.ndx -o nvt.tpr; $GMX mdrun -v -deffnm nvt $MDRUN_OPTS; }
+[ -f npt.gro ] || { $GMX grompp -f mdp/npt.mdp -c nvt.gro -r nvt.gro -t nvt.cpt -p topol.top -n index.ndx -o npt.tpr; $GMX mdrun -v -deffnm npt $MDRUN_OPTS; }
+
+echo "==> 8/8 Producción (@@PROD@@ ns)"
+[ -f md.gro ] || { $GMX grompp -f mdp/md.mdp -c npt.gro -t npt.cpt -p topol.top -n index.ndx -o md.tpr; $GMX mdrun -v -deffnm md $MDRUN_OPTS; }
+echo "Hecho. Trayectoria: md.xtc  ·  Energías: md.edr  ·  Estructura final: md.gro"
+"""
+
+
+def build_gmx_script(p, has_ligand, net_charge):
+    ligand_params = ""
+    merge = "cp protein.gro complex.gro"
+    index = "echo q | $GMX make_ndx -f em.gro -o index.ndx"
+    if has_ligand:
+        ligand_params = (
+            'if [ ! -f LIG_GMX.itp ]; then\n'
+            f'  echo "==> 0/8 Parametrizando el ligando ({p["gaff"]}, cargas {p["charges"]}, carga neta {net_charge:+d})"\n'
+            '  command -v acpype >/dev/null || { echo "Falta acpype/AmberTools: conda install -c conda-forge ambertools '
+            '&& pip install acpype"; exit 1; }\n'
+            f'  acpype -i ligand_pose.mol2 -b LIG -n {int(net_charge)} -a {p["gaff"]} -c {p["charges"]}\n'
+            '  cp LIG.acpype/LIG_GMX.itp LIG.acpype/LIG_GMX.gro LIG.acpype/posre_LIG.itp .\n'
+            'fi\n')
+        merge = "python3 prepare_system.py merge protein.gro LIG_GMX.gro topol.top LIG_GMX.itp complex.gro"
+        index = "printf '\"Protein\" | \"LIG\"\\nq\\n' | $GMX make_ndx -f em.gro -o index.ndx"
+    return (_GMX_SCRIPT.replace("@@LIGAND_PARAMS@@", ligand_params).replace("@@MERGE@@", merge)
+            .replace("@@INDEX@@", index).replace("@@FF@@", p["ff"]).replace("@@WATER@@", p["water"])
+            .replace("@@BOX@@", p["box"]).replace("@@DIST@@", f'{p["dist"]:g}')
+            .replace("@@SOLVENT@@", GMX_WATERS[p["water"]]).replace("@@CONC@@", f'{p["conc"]:g}')
+            .replace("@@PROD@@", f'{p["prod_ns"]:g}'))
+
+
+def build_gmx_readme(p, has_ligand, net_charge, changes, n_prot_atoms, built=None):
+    lig = (f"- **Ligando**: {p['gaff'].upper()} con cargas {'AM1-BCC' if p['charges'] == 'bcc' else 'Gasteiger'} "
+           f"(acpype), carga neta {net_charge:+d}.\n" if has_ligand else "- Sistema sin ligando (apo).\n")
+    ren = ", ".join(f"{v}×{k}" for k, v in sorted(changes.items())) or "ninguno"
+    built_txt = ""
+    if built:
+        built_txt = ("\n## Sistema ya construido\n"
+                     f"Esta carpeta incluye el sistema solvatado y neutralizado (`solv_ions.gro`, `topol.top`, "
+                     f"`index.ndx`, `em.tpr`): {built}\nEl script omite los pasos ya hechos.\n")
+    return f"""# Entrada para GROMACS — generada por BioDock Studio
+
+## Contenido
+- `protein_amber.pdb`: proteína con H a pH (PDB2PQR/PROPKA); residuos renombrados según su estado de protonación
+  ({ren}) para que `pdb2gmx` los respete.
+{"- `ligand_pose.mol2` / `.sdf`: ligando con H en su pose (coordenadas del complejo)." + chr(10) if has_ligand else ""}{"- `LIG_GMX.itp`, `LIG_GMX.gro`, `posre_LIG.itp`: topología del ligando (acpype)." + chr(10) if has_ligand else ""}- `mdp/`: ions, em, nvt, npt, md.
+- `prepare_system.py`: une ligando y proteína (solo biblioteca estándar de Python).
+- `run_gromacs.sh`: todo el flujo, reanudable.
+{built_txt}
+## Modelo
+- **Proteína**: {p['ff']} · **agua**: {p['water']} · caja {p['box']} a {p['dist']:g} nm · NaCl {p['conc']:g} M (+ neutralización).
+{lig}- {p['temp']:g} K, {p['pres']:g} bar, paso {p['dt'] * 1000:g} fs, restricciones h-bonds (LINCS), PME, cutoffs 1,0 nm.
+- Fases: minimización ({p['em_steps']} pasos) → NVT {p['nvt_ps']:g} ps → NPT {p['npt_ps']:g} ps (C-rescale) →
+  producción {p['prod_ns']:g} ns (Parrinello-Rahman), trayectoria cada {p['out_ps']:g} ps.
+
+## Cómo usarlo
+```bash
+bash run_gromacs.sh
+# con GPU:   MDRUN_OPTS="-nb gpu -pme gpu" bash run_gromacs.sh
+```
+Requisitos: GROMACS ≥ 2021 (C-rescale){", acpype y AmberTools (solo si falta `LIG_GMX.itp`)" if has_ligand else ""}.
+
+## Antes de producir resultados
+- Revisa el sistema tras la minimización y las equilibraciones (temperatura, presión, densidad, RMSD).
+- Átomos de la proteína en el PDB de entrada: {n_prot_atoms}. Comprueba que no haya huecos de cadena ni residuos
+  no estándar (`pdb2gmx` avisará).
+- Las cargas AM1-BCC/GAFF2 son una aproximación estándar para ligandos orgánicos; metales, cofactores o ligandos
+  covalentes necesitan una parametrización específica.
+- Una pose de docking no es un estado de equilibrio: la minimización y la equilibración con restricciones sirven
+  para relajarla antes de la producción.
+"""
+
+
+def build_gmx_package(p, protein_pdb, ligand=None, lig_files=None):
+    """Devuelve ({ruta: contenido}, resumen). ligand = (mol2, sdf, carga_neta) o None; lig_files = salida de acpype."""
+    prot_lines = [l for l in protein_pdb.splitlines() if l.startswith(("ATOM", "HETATM", "TER"))]
+    prot_txt, changes = amberize_pdb("\n".join(prot_lines) + "\nEND\n")
+    n_atoms = sum(1 for l in prot_lines if l.startswith(("ATOM", "HETATM")))
+    has_lig = ligand is not None
+    net = ligand[2] if has_lig else 0
+    grp = "Protein_LIG" if has_lig else "Protein"
+    files = {"protein_amber.pdb": prot_txt, "prepare_system.py": _GMX_HELPERS.strip() + "\n"}
+    for name, txt in mdp_files(p["temp"], p["pres"], p["dt"], p["em_steps"], p["nvt_ps"], p["npt_ps"],
+                               p["prod_ns"], p["out_ps"], grp).items():
+        files[f"mdp/{name}"] = txt
+    if has_lig:
+        files["ligand_pose.mol2"], files["ligand_pose.sdf"] = ligand[0], ligand[1]
+        if lig_files:
+            files.update(lig_files)
+    files["run_gromacs.sh"] = build_gmx_script(p, has_lig, net)
+    return files, {"changes": changes, "n_prot_atoms": n_atoms, "has_ligand": has_lig, "net": net}
+
+
+def run_gmx_build(files, p, gmx, has_ligand, progress=None):
+    """Construye y valida el sistema con GROMACS: pdb2gmx → complejo → caja → solvatación → iones → grompp (EM y
+    fases de dinámica). Devuelve (ok, resumen, archivos construidos, registro)."""
+    log = []
+    env = dict(os.environ, GMX_MAXBACKUP="-1")
+    with tempfile.TemporaryDirectory() as td:
+        for rel, txt in files.items():
+            path = os.path.join(td, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                f.write(txt)
+
+        def run(args, stdin=None, label=""):
+            if progress:
+                progress(label)
+            r = subprocess.run([gmx] + args, cwd=td, input=stdin, capture_output=True, text=True,
+                               timeout=3600, env=env)
+            log.append(f"$ gmx {' '.join(args)}\n{(r.stdout + r.stderr).strip()[-1200:]}")
+            if r.returncode != 0:
+                tail = (r.stderr or r.stdout).strip()
+                fatal = re.search(r"Fatal error:\n(.*?)\n\nFor more", tail, flags=re.S)
+                raise RuntimeError(f"{label} falló: " + (fatal.group(1).strip() if fatal else tail[-400:]))
+            return r
+
+        try:
+            run(["pdb2gmx", "-f", "protein_amber.pdb", "-o", "protein.gro", "-p", "topol.top", "-i", "posre.itp",
+                 "-ff", p["ff"], "-water", p["water"], "-ignh"], label="pdb2gmx (topología de la proteína)")
+            if has_ligand:
+                pg, lg = (open(os.path.join(td, n)).read() for n in ("protein.gro", "LIG_GMX.gro"))
+                itp = open(os.path.join(td, "LIG_GMX.itp")).read()
+                top = open(os.path.join(td, "topol.top")).read()
+                open(os.path.join(td, "complex.gro"), "w").write(merge_gro(pg, lg))
+                open(os.path.join(td, "LIG_GMX.itp"), "w").write(normalize_ligand_itp(itp))
+                open(os.path.join(td, "topol.top"), "w").write(patch_topology(top))
+            else:
+                shutil.copy(os.path.join(td, "protein.gro"), os.path.join(td, "complex.gro"))
+            run(["editconf", "-f", "complex.gro", "-o", "newbox.gro", "-c", "-d", f'{p["dist"]:g}',
+                 "-bt", p["box"]], label="editconf (caja)")
+            run(["solvate", "-cp", "newbox.gro", "-cs", GMX_WATERS[p["water"]], "-p", "topol.top",
+                 "-o", "solv.gro"], label="solvate (agua)")
+            run(["grompp", "-f", "mdp/ions.mdp", "-c", "solv.gro", "-p", "topol.top", "-o", "ions.tpr",
+                 "-maxwarn", "1"], label="grompp (iones)")
+            run(["genion", "-s", "ions.tpr", "-o", "solv_ions.gro", "-p", "topol.top", "-pname", "NA",
+                 "-nname", "CL", "-neutral", "-conc", f'{p["conc"]:g}'], stdin="SOL\n", label="genion (iones)")
+            ndx_in = '"Protein" | "LIG"\nq\n' if has_ligand else "q\n"
+            run(["make_ndx", "-f", "solv_ions.gro", "-o", "index.ndx"], stdin=ndx_in, label="make_ndx (índices)")
+            run(["grompp", "-f", "mdp/em.mdp", "-c", "solv_ions.gro", "-p", "topol.top", "-o", "em.tpr"],
+                label="grompp (minimización)")
+            for ph in ("nvt", "npt", "md"):    # validación: construye los .tpr con las coordenadas solvatadas
+                run(["grompp", "-f", f"mdp/{ph}.mdp", "-c", "solv_ions.gro", "-r", "solv_ions.gro",
+                     "-p", "topol.top", "-n", "index.ndx", "-o", f"_check_{ph}.tpr"], label=f"grompp ({ph}, validación)")
+        except Exception as e:
+            return False, {"error": str(e)}, {}, "\n\n".join(log)
+
+        top_final = open(os.path.join(td, "topol.top")).read()
+        mols = re.findall(r"^\s*([A-Za-z0-9_+\-]+)\s+(\d+)\s*$", top_final.split("[ molecules ]")[-1], flags=re.M)
+        gro = open(os.path.join(td, "solv_ions.gro")).read().splitlines()
+        summary = {"atoms": int(gro[1]), "box": gro[-1].split()[:3], "molecules": {n: int(c) for n, c in mols}}
+        built = {}
+        for rel in ("topol.top", "solv_ions.gro", "index.ndx", "em.tpr", "posre.itp", "protein.gro",
+                    "complex.gro", "newbox.gro", "solv.gro", "ions.tpr", "LIG_GMX.itp", "posre_LIG.itp", "LIG_GMX.gro"):
+            path = os.path.join(td, rel)
+            if os.path.exists(path):
+                built[rel] = open(path, "rb").read()
+        for f_ in os.listdir(td):      # topologías que genera pdb2gmx para cadenas
+            if f_.startswith("topol_") and f_.endswith(".itp"):
+                built[f_] = open(os.path.join(td, f_), "rb").read()
+    return True, summary, built, "\n\n".join(log)
+
+
+def zip_bytes(files):
+    """{ruta: str|bytes} -> ZIP en memoria."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for fname, content in files.items():
+            if fname.endswith(".sh"):
+                zi = zipfile.ZipInfo(fname)
+                zi.external_attr = 0o755 << 16
+                z.writestr(zi, content)
+            else:
+                z.writestr(fname, content)
+    return buf.getvalue()
+
+
 # --- INTERFAZ STREAMLIT ---
 
 st.title("🧬 BioDock Studio: Inspector PDB & Preparación de Docking")
@@ -2107,12 +2649,14 @@ with col_input2:
             btn_fetch = st.button("Buscar en RCSB", type="primary")
 
         if btn_fetch and pdb_code:
-            with st.spinner("Descargando..."):
+            with st.spinner("Descargando estructura..."):
                 data = fetch_pdb_from_web(pdb_code)
                 if data:
                     st.session_state["raw_pdb"] = data
                     st.session_state["pdb_name"] = pdb_code.upper()
-                    st.success("¡Estructura cargada con éxito!")
+                    # Extraer el nombre de la molécula directamente del texto PDB
+                    protein_name = extract_molecule_name(data, default_code=pdb_code)
+                    st.success(f"¡Estructura de '{protein_name}' cargada con éxito!")
                 else:
                     st.error("Error al descargar el PDB.")
     else:
@@ -2129,9 +2673,9 @@ if st.session_state.get("raw_pdb"):
     all_chains = list(chain_summary.keys())
 
     st.markdown("---")
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["👁️ Visor 3D & Preparación", "📊 Propiedades Fisicoquímicas & Secuencia",
-                                            "🧪 Preparación Docking (Vina)", "🚀 Docking (Vina)",
-                                            "📈 Resultados de Docking"])
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["👁️ Visor 3D & Preparación", "📊 Propiedades Fisicoquímicas & Secuencia",
+                                                  "🧪 Preparación Docking (Vina)", "🚀 Docking (Vina)",
+                                                  "📈 Resultados de Docking", "🧬 GROMACS"])
 
     with tab1:
         col_vis, col_panel = st.columns([1.5, 1])
@@ -2148,12 +2692,42 @@ if st.session_state.get("raw_pdb"):
                 )
                 remove_water = st.checkbox("Eliminar moléculas de agua (HOH)", value=True)
                 remove_ions = st.checkbox("Eliminar iones y sales (Na, Cl, Mg...)", value=True)
+                
+                # --- DETECCIÓN AUTOMÁTICA DE HETEROGÉNEOS ---
+                all_hets = get_structure_heterogens(raw_pdb)
+                
+                # Definir qué consideramos cofactores o iones comunes para marcar por defecto
+                common_cofts = {"NAP", "NAD", "NDP", "FAD", "HEM", "CA", "ZN", "MG", "MN", "FE", "K", "NA", "CL", "PO4", "SO4"}
+                default_retained = [h for h in all_hets if h in common_cofts]
+                
+                st.info("💡 **Consejo:** Marca abajo únicamente los cofactores (ej. NAP) e iones (ej. CA) que quieras mantener fijos en la proteína. **Deja desmarcado el ligando que vayas a extraer para hacer docking**.")
+                
+                selected_heterogens = st.multiselect(
+                    "Heterogéneos encontrados en el PDB (selecciona cuáles conservar en el receptor):",
+                    options=all_hets,
+                    default=default_retained,
+                    key=f"auto_hets_{pdb_name}",
+                )
+                
+                # Campo libre por si hay cofactores que no figuran como HETATM estándar
+                manual_hets_input = st.text_input(
+                    "Otros cofactores / iones adicionales a conservar (códigos PDB, separados por comas):",
+                    value="",
+                    key=f"manual_hets_{pdb_name}",
+                    help="Úsalo para introducir manualmente códigos de residuos adicionales."
+                )
+                
+                # Unir selecciones automáticas y manuales
+                manual_list = [c.strip().upper() for c in manual_hets_input.split(",") if c.strip()]
+                retained_tuple = tuple(sorted(list(set(selected_heterogens + manual_list))))
 
             if not selected_chains:
                 st.warning("Selecciona al menos una cadena.")
                 st.stop()
 
-            result = process_pdb_structure(raw_pdb, tuple(selected_chains), remove_water, remove_ions)
+            # Pasar la tupla de elementos retenidos a la función de procesado
+            result = process_pdb_structure(raw_pdb, tuple(selected_chains), remove_water, remove_ions, retained_tuple)
+            
             total_res = sum(len(v) for v in result["chains"].values())
             unique_ligands = {f"{n} {num}:{ch}" for n, num, ch in result["ligands"]}
 
@@ -2275,6 +2849,7 @@ if st.session_state.get("raw_pdb"):
                 result["cleaned"], result["ligand"], style_opt, color_opt,
                 show_protein, show_ligand, min(all_nums), max(all_nums),
                 surf_opacity, pocket_list, outline, spin, inter_data,
+                cofactors=retained_tuple
             )
             showmol(view_obj, height=560, width=700)
 
@@ -2608,6 +3183,12 @@ if st.session_state.get("raw_pdb"):
                     bv.setBackgroundColor('#000000')
                     bv.addModel(result["cleaned"], "pdb")
                     bv.setStyle({'model': 0}, {'cartoon': {'color': '#9aa0aa', 'opacity': 0.85}})
+                    
+                    # PINTAR COFACTORES EN STICKS DENTRO DE LA CAJA
+                    if retained_tuple:
+                        bv.addStyle({'model': 0, 'resn': list(retained_tuple)},
+                                    {'stick': {'colorscheme': 'yellowCarbon', 'radius': 0.20}})
+                    
                     for ch, resis in inside.items():
                         bv.addStyle({'model': 0, 'chain': ch, 'resi': sorted(resis)},
                                     {'stick': {'colorscheme': 'cyanCarbon', 'radius': 0.15}})
@@ -3005,7 +3586,7 @@ if st.session_state.get("raw_pdb"):
                                " ".join(f"{INTER_EMOJI.get(t, '▫️')} {t}" for t in p_chosen)
                                + "  · 🟣 pose" + ("  · 🟢 cristalográfico" if ref_choice != "Ninguno" else ""))
 
-                    pv = build_pose_view(protein_pdb, pmol, p_filtered, res_labels, ref_lig_pdb)
+                    pv = build_pose_view(protein_pdb, pmol, p_filtered, res_labels, ref_lig_pdb, cofactors=retained_tuple)
                     showmol(pv, height=560, width=700)
 
                     if p_filtered:
@@ -3100,3 +3681,199 @@ if st.session_state.get("raw_pdb"):
                     st.warning("No se encontraron poses en el archivo.")
             else:
                 st.info("Sube el archivo de resultados (por ejemplo `out.pdbqt` de Vina) o pega su contenido.")
+
+    with tab6:
+        st.markdown("### 🧬 Entrada para GROMACS (dinámica molecular)")
+        st.caption("Genera un paquete listo para simular: proteína con los H a pH (PDB2PQR/PROPKA), ligando "
+                   "parametrizado (GAFF2 + cargas AM1-BCC con acpype), archivos .mdp y un script reanudable "
+                   "con todo el flujo (pdb2gmx → caja → agua → iones → minimización → NVT → NPT → producción).")
+        tools = gmx_tools_status()
+        lig_tools_ok = bool(tools["acpype"] and tools["antechamber"] and tools["sqm"])
+        g1, g2, g3 = st.columns(3)
+        g1.write(("✅" if tools["gmx"] else "⚪") + " **GROMACS** " +
+                 (tools["gmx_version"] if tools["gmx"] else "no encontrado (opcional: permite construir y validar aquí)"))
+        g2.write(("✅" if lig_tools_ok else "⚪") + " **acpype + AmberTools** " +
+                 ("disponibles" if lig_tools_ok else "no encontrados (el script del paquete parametrizará el ligando donde se ejecute)"))
+        g3.write(("✅" if HAS_PDB2PQR else "⚪") + " **PDB2PQR/PROPKA** " +
+                 ("disponible" if HAS_PDB2PQR else "no instalado"))
+
+        if not (HAS_OB and HAS_RDKIT):
+            st.error("Esta pestaña necesita Open Babel y RDKit: `pip install openbabel-wheel rdkit`.")
+        else:
+            dock6 = st.session_state.get("dock_results")
+            good6 = {n: v for n, v in (dock6["items"] if dock6 else {}).items() if v.get("ok")}
+            cry6 = st.session_state.get("lig_prep")
+            kinds = []
+            if good6:
+                kinds.append("Complejo con una pose de docking")
+            if cry6:
+                kinds.append("Complejo con el ligando cristalográfico preparado")
+            kinds.append("Solo proteína (apo)")
+            # clave ligada a las opciones: si aparecen nuevas (tras preparar/acoplar), el selector se reinicia
+            kind = st.radio("Sistema a simular:", kinds,
+                            key="gm_kind_" + hashlib.md5("|".join(kinds).encode()).hexdigest()[:6])
+
+            mol6, lig_desc = None, ""
+            if kind.startswith("Complejo con una pose"):
+                nm6 = st.selectbox("Ligando acoplado:", list(good6), key="gm_dock_lig")
+                poses6, _, _ = load_poses("out.pdbqt", good6[nm6]["pdbqt"], "")
+                k6 = st.selectbox("Pose:", list(range(len(poses6))), key="gm_pose",
+                                  format_func=lambda k: f"Pose {k + 1}" + (
+                                      f" · {poses6[k]['score']:.2f} kcal/mol" if poses6[k]["score"] is not None else ""))
+                mol6, lig_desc = pose_mol(poses6[k6]["molblock"]), f"{nm6} · pose {k6 + 1}"
+            elif kind.startswith("Complejo con el ligando cristalográfico"):
+                mol6 = Chem.MolFromMolBlock(cry6[1]["sdf"], removeHs=False)
+                lig_desc = f"{cry6[1]['name']} (cristalográfico)"
+            has_lig6 = mol6 is not None
+            if has_lig6 and not any(a.GetAtomicNum() == 1 for a in mol6.GetAtoms()):
+                mol6 = Chem.AddHs(mol6, addCoords=True)
+                st.warning("El ligando no traía hidrógenos: se añadieron sin considerar el pH. Revisa su estado de "
+                           "protonación (el PDBQT de Vina no incluye los H apolares).")
+
+            prepared_rec6 = st.session_state.get("rec_prep")
+            if prepared_rec6:
+                prot_choice = st.radio("Proteína:", ["Receptor protonado preparado (PDB2PQR/PROPKA)",
+                                                     "Proteína limpia (pdb2gmx añade los H)"],
+                                       horizontal=True, key="gm_prot")
+                protein_text6 = (prepared_rec6[1]["pdb"] if prot_choice.startswith("Receptor protonado")
+                                 else result["cleaned"])
+            else:
+                protein_text6 = result["cleaned"]
+                st.info("Prepara el receptor en la pestaña 🧪 (mejor con PDB2PQR + PROPKA) para conservar los estados "
+                        "de protonación de His, Asp y Glu. Sin él, `pdb2gmx` añadirá los H con sus valores por defecto.")
+
+            st.markdown("#### Parámetros")
+            pa, pb, pc = st.columns(3)
+            with pa:
+                ff6 = st.selectbox("Campo de fuerzas (proteína)", GMX_AMBER_FFS, key="gm_ff",
+                                   help="Familia AMBER: es la compatible con GAFF/GAFF2 para el ligando.")
+            with pb:
+                water6 = st.selectbox("Modelo de agua", list(GMX_WATERS), key="gm_water")
+            with pc:
+                box6 = st.selectbox("Caja", ["dodecahedron", "cubic"], key="gm_box",
+                                    format_func=lambda b: "Dodecaedro rómbico (menos agua)" if b == "dodecahedron" else "Cúbica")
+            pd_, pe, pf = st.columns(3)
+            with pd_:
+                dist6 = st.number_input("Distancia soluto–borde (nm)", 0.8, 3.0, 1.0, 0.1, key="gm_dist")
+            with pe:
+                conc6 = st.number_input("NaCl (M)", 0.0, 1.0, 0.15, 0.05, key="gm_conc")
+            with pf:
+                temp6 = st.number_input("Temperatura (K)", 250.0, 400.0, 300.0, 1.0, key="gm_temp")
+            pg_, ph_, pi_ = st.columns(3)
+            with pg_:
+                pres6 = st.number_input("Presión (bar)", 0.5, 10.0, 1.0, 0.5, key="gm_pres")
+            with ph_:
+                dt6 = st.selectbox("Paso de integración (fs)", [2, 1, 4], key="gm_dt",
+                                   help="2 fs con restricciones h-bonds es lo estándar. 4 fs exige masas de H aumentadas.")
+            with pi_:
+                em6 = st.number_input("Pasos de minimización", 10, 100000, 5000, 500, key="gm_em")
+            pj, pk, pl = st.columns(3)
+            with pj:
+                nvt6 = st.number_input("NVT (ps)", 1.0, 5000.0, 100.0, 10.0, key="gm_nvt")
+            with pk:
+                npt6 = st.number_input("NPT (ps)", 1.0, 5000.0, 100.0, 10.0, key="gm_npt")
+            with pl:
+                prod6 = st.number_input("Producción (ns)", 0.001, 10000.0, 10.0, 1.0, key="gm_prod")
+            pm_, pn_ = st.columns(2)
+            with pm_:
+                out6 = st.number_input("Guardar trayectoria cada (ps)", 1.0, 1000.0, 10.0, 1.0, key="gm_out")
+            gaff6, charges6 = "gaff2", "bcc"
+            if has_lig6:
+                with pn_:
+                    gaff6 = st.selectbox("Campo de fuerzas del ligando", ["gaff2", "gaff"], key="gm_gaff")
+                charges6 = st.radio("Cargas del ligando", ["bcc", "gas"], horizontal=True, key="gm_chg",
+                                    format_func=lambda c: "AM1-BCC (recomendado, más lento)" if c == "bcc"
+                                    else "Gasteiger (rápido, menos preciso)")
+
+            build_now6 = False
+            if tools["gmx"]:
+                build_now6 = st.checkbox("Construir y validar el sistema ahora con GROMACS "
+                                         "(pdb2gmx → solvate → genion → grompp)", value=True, key="gm_build")
+
+            p6 = dict(ff=ff6, water=water6, box=box6, dist=float(dist6), conc=float(conc6), temp=float(temp6),
+                      pres=float(pres6), dt=dt6 / 1000.0, em_steps=int(em6), nvt_ps=float(nvt6),
+                      npt_ps=float(npt6), prod_ns=float(prod6), out_ps=float(out6), gaff=gaff6, charges=charges6)
+            sig6 = (kind, lig_desc, tuple(sorted(p6.items())), hashlib.md5(protein_text6.encode()).hexdigest()[:8])
+
+            if st.button("📦 Generar paquete GROMACS", type="primary", use_container_width=True, key="gm_go"):
+                try:
+                    ligand6, lig_files6, net6 = None, None, 0
+                    if has_lig6:
+                        mol2_6, sdf6, net6, _nat6 = mol_to_mol2_sdf(mol6)
+                        ligand6 = (mol2_6, sdf6, net6)
+                        if lig_tools_ok:
+                            with st.spinner("Parametrizando el ligando con acpype "
+                                            "(AM1-BCC puede tardar de 1 a 3 minutos)..."):
+                                lig_files6 = ligand_gromacs_params(mol2_6, net6, gaff6, charges6)
+                    files6, info6 = build_gmx_package(p6, protein_text6, ligand6, lig_files6)
+                    built_msg, build_log, summ6 = None, "", None
+                    build_err = None
+                    if build_now6 and tools["gmx"]:
+                        if has_lig6 and not lig_files6:
+                            build_err = ("No se puede construir aquí sin la topología del ligando "
+                                         "(faltan acpype/AmberTools); el script del paquete lo hará.")
+                        else:
+                            bar6 = st.progress(0.0, text="Construyendo el sistema...")
+                            counter = {"n": 0}
+
+                            def _prog6(label):
+                                counter["n"] += 1
+                                bar6.progress(min(counter["n"] / 11, 0.99), text=label)
+                            ok6, summ6, built6, build_log = run_gmx_build(files6, p6, tools["gmx"], has_lig6,
+                                                                          progress=_prog6)
+                            bar6.empty()
+                            if ok6:
+                                files6.update(built6)
+                                mols6 = summ6["molecules"]
+                                built_msg = (f"{summ6['atoms']:,} átomos; " +
+                                             ", ".join(f"{n} × {c}" for n, c in mols6.items()) + ".")
+                            else:
+                                build_err = summ6.get("error", "error desconocido")
+                    files6["README.md"] = build_gmx_readme(p6, has_lig6, net6, info6["changes"],
+                                                           info6["n_prot_atoms"], built=built_msg)
+                    st.session_state["gmx_pkg"] = {
+                        "sig": sig6, "zip": zip_bytes(files6), "files": sorted(files6),
+                        "script": files6["run_gromacs.sh"], "mdp": {k: v for k, v in files6.items() if k.startswith("mdp/")},
+                        "summary": summ6 if built_msg else None, "built_msg": built_msg, "build_err": build_err,
+                        "log": build_log, "info": info6, "net": net6, "lig_params": bool(lig_files6)}
+                except Exception as e:
+                    st.session_state.pop("gmx_pkg", None)
+                    st.error(f"No se pudo generar el paquete: {e}")
+
+            pkg = st.session_state.get("gmx_pkg")
+            if pkg and pkg["sig"] == sig6:
+                name6 = f"{pdb_name}_{safe_name(lig_desc) if has_lig6 else 'apo'}_gromacs"
+                if pkg["build_err"]:
+                    st.warning("El paquete se generó, pero la construcción con GROMACS falló: " + pkg["build_err"])
+                elif pkg["built_msg"]:
+                    st.success("✅ Sistema construido y validado con `grompp` (minimización, NVT, NPT y producción): "
+                               + pkg["built_msg"])
+                    s_ = pkg["summary"]
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Átomos", f"{s_['atoms']:,}")
+                    m2.metric("Aguas", f"{s_['molecules'].get('SOL', 0):,}")
+                    m3.metric("Na⁺ / Cl⁻", f"{s_['molecules'].get('NA', 0)} / {s_['molecules'].get('CL', 0)}")
+                    m4.metric("Caja (nm)", " × ".join(f"{float(x):.1f}" for x in s_["box"]))
+                else:
+                    st.success("✅ Paquete generado.")
+                if has_lig6:
+                    st.caption(f"Ligando: carga neta {pkg['net']:+d} · " +
+                               ("topología GAFF generada aquí con acpype." if pkg["lig_params"] else
+                                "sin topología: el script ejecutará acpype donde corras GROMACS."))
+                if pkg["info"]["changes"]:
+                    st.caption("Estados de protonación respetados: " +
+                               ", ".join(f"{v} × {k}" for k, v in sorted(pkg["info"]["changes"].items())))
+                st.download_button("📥 Descargar paquete GROMACS (.zip)", pkg["zip"], file_name=f"{name6}.zip",
+                                   mime="application/zip", type="primary", use_container_width=True, key="gm_dl")
+                with st.expander("📄 Archivos del paquete"):
+                    st.code("\n".join(pkg["files"]), language="text")
+                with st.expander("▶️ run_gromacs.sh (flujo completo)"):
+                    st.code(pkg["script"], language="bash")
+                with st.expander("⚙️ Parámetros .mdp"):
+                    mdp_pick = st.selectbox("Fase:", sorted(pkg["mdp"]), key="gm_mdp_pick")
+                    st.code(pkg["mdp"][mdp_pick], language="ini")
+                if pkg["log"]:
+                    with st.expander("🧾 Registro de GROMACS"):
+                        st.code(pkg["log"][-6000:], language="text")
+            elif pkg:
+                st.caption("Los ajustes han cambiado: pulsa de nuevo «Generar paquete GROMACS».")
