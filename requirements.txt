@@ -23,6 +23,7 @@ vina; sys_platform == "linux" and python_version < "3.13"
 
 # --- GROMACS: parametrizar ligandos (GAFF2). acpype necesita además AmberTools (conda install -c conda-forge ambertools);
 #     sin él la app igual genera el paquete y el script lo parametrizará donde corras GROMACS ---
+ambertools
 acpype
 
 # --- Opcional: exportar la sesión .pse de PyMOL. Descomenta si quieres el .pse real
