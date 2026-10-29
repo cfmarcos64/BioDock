@@ -2725,13 +2725,13 @@ if st.session_state.get("raw_pdb"):
                 all_hets = get_structure_heterogens(raw_pdb)
                 
                 # Definir qué consideramos cofactores o iones comunes para marcar por defecto
-                common_cofts = {"NAP", "NAD", "NDP", "FAD", "HEM", "CA", "ZN", "MG", "MN", "FE", "K", "NA", "CL", "PO4", "SO4"}
+                common_cofts = {"NAP", "NAD", "NDP", "FAD", "PQQ", "HEM", "CA", "ZN", "MG", "MN", "FE", "K", "NA", "CL", "PO4", "SO4"}
                 default_retained = [h for h in all_hets if h in common_cofts]
                 
                 st.info("💡 **Consejo:** Marca abajo únicamente los cofactores (ej. NAP) e iones (ej. CA) que quieras mantener fijos en la proteína. **Deja desmarcado el ligando que vayas a extraer para hacer docking**.")
                 
                 selected_heterogens = st.multiselect(
-                    "Heterogéneos encontrados en el PDB (selecciona cuáles conservar en el receptor):",
+                    "Residuos no proteicos encontrados en el PDB (selecciona cuáles conservar en el receptor):",
                     options=all_hets,
                     default=default_retained,
                     key=f"auto_hets_{pdb_name}",
