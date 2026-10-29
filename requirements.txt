@@ -21,6 +21,10 @@ plip
 # --- Docking: el paquete `vina` solo tiene ruedas para Linux y Python <= 3.12 ---
 vina; sys_platform == "linux" and python_version < "3.13"
 
+# --- GROMACS: parametrizar ligandos (GAFF2). acpype necesita además AmberTools (conda install -c conda-forge ambertools);
+#     sin él la app igual genera el paquete y el script lo parametrizará donde corras GROMACS ---
+acpype
+
 # --- Opcional: exportar la sesión .pse de PyMOL. Descomenta si quieres el .pse real
 # (si falla la instalación, la app entrega un script .pml en su lugar) ---
 # pymol-open-source>=3.0.0a0
