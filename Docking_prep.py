@@ -98,20 +98,48 @@ hr { border-color: var(--border) !important; }
 
 /* Botones */
 .stButton > button, .stDownloadButton > button {
-    border-radius: 10px; border: 1px solid #2a3242; background: #0f131b; color: var(--text); }
+    border-radius: 10px !important; 
+    border: 1px solid #3a445d !important; /* Mismo borde visible para los botones */
+    background: #0f131b !important; 
+    color: var(--text) !important; 
+}
+
 .stButton > button:hover, .stDownloadButton > button:hover {
-    border-color: var(--accent); color: var(--accent); }
-button[kind="primary"], button[data-testid="stBaseButton-primary"] {
-    background: linear-gradient(90deg, #19e3c5, #4d7cff) !important; color: #000 !important;
-    border: none !important; font-weight: 700; }
-button[kind="primary"]:hover, button[data-testid="stBaseButton-primary"]:hover { filter: brightness(1.15); color:#000 !important; }
+    border-color: var(--accent) !important; /* Se ilumina en verde al pasar el ratón */
+    color: var(--accent) !important; 
+}
+
+/* Desplegables flotantes (popovers) */
+div[data-baseweb="popover"] ul, div[data-baseweb="popover"] > div { 
+    background-color: var(--panel) !important; 
+    border: 1px solid #3a445d !important;
+}
+
+span[data-baseweb="tag"] { 
+    background-color: #0f2f36 !important; 
+    color: var(--accent) !important; 
+}
 
 /* Inputs */
-div[data-baseweb="select"] > div, div[data-baseweb="input"] > div, textarea,
-[data-testid="stFileUploaderDropzone"] { background-color: var(--panel) !important;
-    border-color: #222836 !important; color: var(--text) !important; }
-div[data-baseweb="popover"] ul, div[data-baseweb="popover"] > div { background-color: var(--panel) !important; }
-span[data-baseweb="tag"] { background-color: #0f2f36 !important; color: var(--accent) !important; }
+/* Campos de texto, selectores, áreas de texto y uploader */
+div[data-baseweb="select"] > div, 
+div[data-baseweb="input"] > div, 
+textarea,
+[data-testid="stFileUploaderDropzone"] { 
+    background-color: var(--panel) !important;
+    border: 1px solid #3a445d !important; /* Borde gris claro y visible sobre fondo negro */
+    color: #ffffff !important; 
+}
+
+/* Forzar color de texto blanco y nítido dentro de los inputs */
+input, textarea, div[data-baseweb="select"] span {
+    color: #ffffff !important;
+}
+
+/* Texto secundario / placeholder */
+input::placeholder, textarea::placeholder {
+    color: #9ca3af !important; 
+}
 
 /* Pestañas */
 button[data-baseweb="tab"] { color: var(--muted); background: transparent; }
@@ -2777,7 +2805,7 @@ if st.session_state.get("raw_pdb"):
             with c2:
                 show_ligand = st.checkbox("Ligando", value=True)
             with c3:
-                outline = st.checkbox("Contorno", value=True,
+                outline = st.checkbox("Contorno", value=False,
                                       help="Dibuja una línea blanca alrededor de las formas: separa las "
                                            "zonas que se solapan y da relieve a la estructura.")
             with c4:
