@@ -158,202 +158,6 @@ def fetch_pdb_from_web(pdb_code):
         return None
     
 
-
-# ==============================================================================
-# 1. CONFIGURACIÓN DE PÁGINA Y CARGA DE DATOS STREAMLIT
-# ==============================================================================
-st.set_page_config(
-    page_title="BioDock Studio | Prep & Inspector",
-    page_icon="🧬",
-    layout="wide",
-)
-
-st.title("🧬 BioDock Studio: Inspector PDB & Preparación de Docking")
-
-# Cabecera persistente si la proteína ya está cargada
-if st.session_state.get("raw_pdb"):
-    p_name_display = st.session_state.get("pdb_name", "PROTEIN")
-    p_molecule_title = st.session_state.get("molecule_title", "Complejo Proteico")
-    st.markdown(f"### 🏷️ Estructura Activa: **`{p_name_display}`** — *{p_molecule_title}*")
-
-st.markdown("Herramienta bioinformática avanzada para visualización y preparación de complejos macromoleculares.")
-st.markdown("---")
-
-st.markdown("### 📥 1. Cargar Estructura Proteica")
-col_input1, col_input2 = st.columns([1, 2])
-
-with col_input1:
-    input_method = st.radio(
-        "Método de entrada:",
-        ["Código PDB (Ej. 1HSG, 4AKE)", "Subir archivo .pdb local"],
-        key="input_method"
-    )
-
-with col_input2:
-    if input_method == "Código PDB (Ej. 1HSG, 4AKE)":
-        def _trigger_fetch():
-            st.session_state["do_fetch_pdb"] = True
-
-        c_code, c_btn = st.columns([2, 1])
-        with c_code:
-            pdb_code = st.text_input(
-                "Código PDB:", 
-                value="1HSG", 
-                key="pdb_code_input",
-                on_change=_trigger_fetch
-            ).strip()
-            
-        with c_btn:
-            st.markdown("<br>", unsafe_allow_html=True)
-            btn_fetch = st.button("Buscar en RCSB", type="primary")
-
-        if btn_fetch or st.session_state.get("do_fetch_pdb", False):
-            st.session_state["do_fetch_pdb"] = False
-            
-            if pdb_code:
-                with st.spinner("Descargando estructura..."):
-                    data = fetch_pdb_from_web(pdb_code)
-                    if data:
-                        st.session_state["raw_pdb"] = data
-                        st.session_state["pdb_name"] = pdb_code.upper()
-                        protein_name = extract_molecule_name(data, default_code=pdb_code)
-                        st.session_state["molecule_title"] = protein_name
-                        st.success(f"¡Estructura de '{protein_name}' cargada con éxito!")
-                        st.rerun()
-                    else:
-                        st.error("Error al descargar el PDB.")
-                        
-    else:
-        uploaded_file = st.file_uploader("Sube tu archivo .pdb", type=["pdb"])
-        if uploaded_file is not None:
-            pdb_content = uploaded_file.getvalue().decode('utf-8', errors='ignore')
-            st.session_state["raw_pdb"] = pdb_content
-            st.session_state["pdb_name"] = uploaded_file.name.rsplit('.', 1)[0]
-            st.session_state["molecule_title"] = extract_molecule_name(pdb_content, default_code=uploaded_file.name)
-
-# ==============================================================================
-# 2. ESTILOS CSS Y DICCIONARIOS GLOBALES
-# ==============================================================================
-st.markdown(
-    """
-<style>
-:root { --bg:#000000; --panel:#0a0c10; --border:#1e2430; --accent:#19e3c5;
-        --accent2:#4d7cff; --text:#e8eaed; --muted:#c0c7d0; }
-
-html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"],
-[data-testid="stToolbar"], [data-testid="stSidebar"] { background-color: var(--bg) !important; color: var(--text); }
-
-.block-container { padding-top: 2rem; max-width: 1500px; }
-
-h1 { background: linear-gradient(90deg, #19e3c5, #4d7cff, #b06bff);
-     -webkit-background-clip: text; -webkit-text-fill-color: transparent; font-weight: 800; }
-h2, h3, h4, h5 { color: #ffffff !important; }
-p, li, label, span, .stMarkdown, [data-testid="stCaptionContainer"] { color: var(--text); }
-[data-testid="stCaptionContainer"] * { color: var(--muted) !important; }
-hr { border-color: var(--border) !important; }
-
-/* Contenedores con borde */
-[data-testid="stVerticalBlockBorderWrapper"] { border-color: var(--border) !important; border-radius: 14px; }
-
-/* Métricas */
-[data-testid="stMetric"] { background: var(--panel); border: 1px solid var(--border);
-                           border-radius: 12px; padding: 12px 16px; }
-[data-testid="stMetricLabel"] * { color: var(--muted) !important; }
-[data-testid="stMetricValue"] { color: var(--accent) !important; }
-
-/* Botones */
-.stButton > button, .stDownloadButton > button {
-    border-radius: 10px !important; 
-    border: 1px solid #3a445d !important; 
-    background: #0f131b !important; 
-    color: var(--text) !important; 
-}
-
-.stButton > button:hover, .stDownloadButton > button:hover {
-    border-color: var(--accent) !important; 
-    color: var(--accent) !important; 
-}
-
-/* Desplegables flotantes */
-div[data-baseweb="popover"] ul, div[data-baseweb="popover"] > div { 
-    background-color: var(--panel) !important; 
-    border: 1px solid #3a445d !important;
-}
-
-span[data-baseweb="tag"] { 
-    background-color: #0f2f36 !important; 
-    color: var(--accent) !important; 
-}
-
-/* Inputs */
-div[data-baseweb="select"] > div, 
-div[data-baseweb="input"] > div, 
-textarea,
-[data-testid="stFileUploaderDropzone"] { 
-    background-color: var(--panel) !important;
-    border: 1px solid #3a445d !important; 
-    color: #ffffff !important; 
-}
-
-input, textarea, div[data-baseweb="select"] span {
-    color: #ffffff !important;
-}
-
-input::placeholder, textarea::placeholder {
-    color: #9ca3af !important; 
-}
-
-/* Pestañas */
-button[data-baseweb="tab"] { color: var(--muted); background: transparent; }
-button[data-baseweb="tab"][aria-selected="true"] { color: var(--accent); }
-div[data-baseweb="tab-highlight"] { background-color: var(--accent) !important; }
-div[data-baseweb="tab-border"] { background-color: var(--border) !important; }
-
-/* Código / secuencia */
-[data-testid="stCode"] pre, [data-testid="stCode"] code { background: var(--panel) !important; color: #b8f5e8 !important; }
-[data-testid="stAlert"] { background: var(--panel); border: 1px solid var(--border); }
-</style>
-""",
-    unsafe_allow_html=True,
-)
-
-AA_3TO1 = {
-    'ALA': 'A', 'CYS': 'C', 'ASP': 'D', 'GLU': 'E', 'PHE': 'F',
-    'GLY': 'G', 'HIS': 'H', 'ILE': 'I', 'LYS': 'K', 'LEU': 'L',
-    'MET': 'M', 'ASN': 'N', 'PRO': 'P', 'GLN': 'Q', 'ARG': 'R',
-    'SER': 'S', 'THR': 'T', 'VAL': 'V', 'TRP': 'W', 'TYR': 'Y',
-    'MSE': 'M',
-}
-WATER_NAMES = {"HOH", "WAT", "DOD", "H2O"}
-COMMON_IONS = {"NA", "CL", "K", "MG", "ZN", "CA", "FE", "CU", "MN", "SO4", "PO4", "EDTA"}
-
-# ==============================================================================
-# 3. PREPARACIÓN DE VARIABLES Y RENDERIZADO DE PESTAÑAS (TABS)
-# ==============================================================================
-if st.session_state.get("raw_pdb"):
-    raw_pdb = st.session_state["raw_pdb"]
-    pdb_name = st.session_state.get("pdb_name", "Protein")
-    chain_summary = get_chain_summary(raw_pdb)
-    all_chains = list(chain_summary.keys())
-
-    st.markdown("---")
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-        "👁️ Visor 3D & Preparación", 
-        "📊 Propiedades Fisicoquímicas & Secuencia",
-        "🧪 Preparación Docking (Vina)", 
-        "🚀 Docking (Vina)",
-        "📈 Resultados de Docking", 
-        "🧬 GROMACS", 
-        "⚡ OpenMM"
-    ])
-
-    # A continuación continuas con:
-    # with tab1:
-    #     ...
-
-
-# --- FUNCIONES AUXILIARES ---
-
 def get_structure_heterogens(pdb_text):
     """Escanea el PDB y devuelve una lista ordenada de nombres de residuos no estándar (HETATM que no son agua)."""
     structure = PDB.PDBParser(QUIET=True).get_structure("het", io.StringIO(pdb_text))
@@ -597,6 +401,202 @@ def format_chain_block(residues, width=60):
         out.append(f"       {ss}")
         out.append("")
     return "\n".join(out)
+
+
+# ==============================================================================
+# 1. CONFIGURACIÓN DE PÁGINA Y CARGA DE DATOS STREAMLIT
+# ==============================================================================
+st.set_page_config(
+    page_title="BioDock Studio | Prep & Inspector",
+    page_icon="🧬",
+    layout="wide",
+)
+
+st.title("🧬 BioDock Studio: Inspector PDB & Preparación de Docking")
+
+# Cabecera persistente si la proteína ya está cargada
+if st.session_state.get("raw_pdb"):
+    p_name_display = st.session_state.get("pdb_name", "PROTEIN")
+    p_molecule_title = st.session_state.get("molecule_title", "Complejo Proteico")
+    st.markdown(f"### 🏷️ Estructura Activa: **`{p_name_display}`** — *{p_molecule_title}*")
+
+st.markdown("Herramienta bioinformática avanzada para visualización y preparación de complejos macromoleculares.")
+st.markdown("---")
+
+st.markdown("### 📥 1. Cargar Estructura Proteica")
+col_input1, col_input2 = st.columns([1, 2])
+
+with col_input1:
+    input_method = st.radio(
+        "Método de entrada:",
+        ["Código PDB (Ej. 1HSG, 4AKE)", "Subir archivo .pdb local"],
+        key="input_method"
+    )
+
+with col_input2:
+    if input_method == "Código PDB (Ej. 1HSG, 4AKE)":
+        def _trigger_fetch():
+            st.session_state["do_fetch_pdb"] = True
+
+        c_code, c_btn = st.columns([2, 1])
+        with c_code:
+            pdb_code = st.text_input(
+                "Código PDB:", 
+                value="1HSG", 
+                key="pdb_code_input",
+                on_change=_trigger_fetch
+            ).strip()
+            
+        with c_btn:
+            st.markdown("<br>", unsafe_allow_html=True)
+            btn_fetch = st.button("Buscar en RCSB", type="primary")
+
+        if btn_fetch or st.session_state.get("do_fetch_pdb", False):
+            st.session_state["do_fetch_pdb"] = False
+            
+            if pdb_code:
+                with st.spinner("Descargando estructura..."):
+                    data = fetch_pdb_from_web(pdb_code)
+                    if data:
+                        st.session_state["raw_pdb"] = data
+                        st.session_state["pdb_name"] = pdb_code.upper()
+                        protein_name = extract_molecule_name(data, default_code=pdb_code)
+                        st.session_state["molecule_title"] = protein_name
+                        st.success(f"¡Estructura de '{protein_name}' cargada con éxito!")
+                        st.rerun()
+                    else:
+                        st.error("Error al descargar el PDB.")
+                        
+    else:
+        uploaded_file = st.file_uploader("Sube tu archivo .pdb", type=["pdb"])
+        if uploaded_file is not None:
+            pdb_content = uploaded_file.getvalue().decode('utf-8', errors='ignore')
+            st.session_state["raw_pdb"] = pdb_content
+            st.session_state["pdb_name"] = uploaded_file.name.rsplit('.', 1)[0]
+            st.session_state["molecule_title"] = extract_molecule_name(pdb_content, default_code=uploaded_file.name)
+
+# ==============================================================================
+# 2. ESTILOS CSS Y DICCIONARIOS GLOBALES
+# ==============================================================================
+st.markdown(
+    """
+<style>
+:root { --bg:#000000; --panel:#0a0c10; --border:#1e2430; --accent:#19e3c5;
+        --accent2:#4d7cff; --text:#e8eaed; --muted:#c0c7d0; }
+
+html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"],
+[data-testid="stToolbar"], [data-testid="stSidebar"] { background-color: var(--bg) !important; color: var(--text); }
+
+.block-container { padding-top: 2rem; max-width: 1500px; }
+
+h1 { background: linear-gradient(90deg, #19e3c5, #4d7cff, #b06bff);
+     -webkit-background-clip: text; -webkit-text-fill-color: transparent; font-weight: 800; }
+h2, h3, h4, h5 { color: #ffffff !important; }
+p, li, label, span, .stMarkdown, [data-testid="stCaptionContainer"] { color: var(--text); }
+[data-testid="stCaptionContainer"] * { color: var(--muted) !important; }
+hr { border-color: var(--border) !important; }
+
+/* Contenedores con borde */
+[data-testid="stVerticalBlockBorderWrapper"] { border-color: var(--border) !important; border-radius: 14px; }
+
+/* Métricas */
+[data-testid="stMetric"] { background: var(--panel); border: 1px solid var(--border);
+                           border-radius: 12px; padding: 12px 16px; }
+[data-testid="stMetricLabel"] * { color: var(--muted) !important; }
+[data-testid="stMetricValue"] { color: var(--accent) !important; }
+
+/* Botones */
+.stButton > button, .stDownloadButton > button {
+    border-radius: 10px !important; 
+    border: 1px solid #3a445d !important; 
+    background: #0f131b !important; 
+    color: var(--text) !important; 
+}
+
+.stButton > button:hover, .stDownloadButton > button:hover {
+    border-color: var(--accent) !important; 
+    color: var(--accent) !important; 
+}
+
+/* Desplegables flotantes */
+div[data-baseweb="popover"] ul, div[data-baseweb="popover"] > div { 
+    background-color: var(--panel) !important; 
+    border: 1px solid #3a445d !important;
+}
+
+span[data-baseweb="tag"] { 
+    background-color: #0f2f36 !important; 
+    color: var(--accent) !important; 
+}
+
+/* Inputs */
+div[data-baseweb="select"] > div, 
+div[data-baseweb="input"] > div, 
+textarea,
+[data-testid="stFileUploaderDropzone"] { 
+    background-color: var(--panel) !important;
+    border: 1px solid #3a445d !important; 
+    color: #ffffff !important; 
+}
+
+input, textarea, div[data-baseweb="select"] span {
+    color: #ffffff !important;
+}
+
+input::placeholder, textarea::placeholder {
+    color: #9ca3af !important; 
+}
+
+/* Pestañas */
+button[data-baseweb="tab"] { color: var(--muted); background: transparent; }
+button[data-baseweb="tab"][aria-selected="true"] { color: var(--accent); }
+div[data-baseweb="tab-highlight"] { background-color: var(--accent) !important; }
+div[data-baseweb="tab-border"] { background-color: var(--border) !important; }
+
+/* Código / secuencia */
+[data-testid="stCode"] pre, [data-testid="stCode"] code { background: var(--panel) !important; color: #b8f5e8 !important; }
+[data-testid="stAlert"] { background: var(--panel); border: 1px solid var(--border); }
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+AA_3TO1 = {
+    'ALA': 'A', 'CYS': 'C', 'ASP': 'D', 'GLU': 'E', 'PHE': 'F',
+    'GLY': 'G', 'HIS': 'H', 'ILE': 'I', 'LYS': 'K', 'LEU': 'L',
+    'MET': 'M', 'ASN': 'N', 'PRO': 'P', 'GLN': 'Q', 'ARG': 'R',
+    'SER': 'S', 'THR': 'T', 'VAL': 'V', 'TRP': 'W', 'TYR': 'Y',
+    'MSE': 'M',
+}
+WATER_NAMES = {"HOH", "WAT", "DOD", "H2O"}
+COMMON_IONS = {"NA", "CL", "K", "MG", "ZN", "CA", "FE", "CU", "MN", "SO4", "PO4", "EDTA"}
+
+# ==============================================================================
+# 3. PREPARACIÓN DE VARIABLES Y RENDERIZADO DE PESTAÑAS (TABS)
+# ==============================================================================
+if st.session_state.get("raw_pdb"):
+    raw_pdb = st.session_state["raw_pdb"]
+    pdb_name = st.session_state.get("pdb_name", "Protein")
+    chain_summary = get_chain_summary(raw_pdb)
+    all_chains = list(chain_summary.keys())
+
+    st.markdown("---")
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+        "👁️ Visor 3D & Preparación", 
+        "📊 Propiedades Fisicoquímicas & Secuencia",
+        "🧪 Preparación Docking (Vina)", 
+        "🚀 Docking (Vina)",
+        "📈 Resultados de Docking", 
+        "🧬 GROMACS", 
+        "⚡ OpenMM"
+    ])
+
+    # A continuación continuas con:
+    # with tab1:
+    #     ...
+
+
+# --- FUNCIONES AUXILIARES ---
 
 
 # --- VISOR 3D ---
