@@ -61,90 +61,112 @@ except Exception:
 HAS_PLIP = HAS_OB and importlib.util.find_spec("plip") is not None
 HAS_PDB2PQR = all(importlib.util.find_spec(m) is not None for m in ("pdb2pqr", "propka"))
 
+# --- CONFIGURACIÓN DE PÁGINA STREAMLIT ---
+st.set_page_config(
+    page_title="BioDock Studio | Prep & Inspector",
+    page_icon="🧬",
+    layout="wide",
+)
 
-def extract_molecule_name(pdb_text, default_code="PROTEIN"):
+# --- TEMA NEGRO (CSS) ---
+st.markdown(
     """
-    Busca en el texto del PDB las líneas COMPND y extrae el valor del campo MOLECULE.
-    """
-    if not pdb_text:
-        return default_code.upper()
-    
-    match = re.search(r"COMPND(?:\s+\d+)?\s+MOLECULE:\s*([^;\n]+);?", pdb_text, re.IGNORECASE)
-    if match:
-        return match.group(1).strip().strip('"\'')
-    
-    return default_code.upper()
+<style>
+:root { --bg:#000000; --panel:#0a0c10; --border:#1e2430; --accent:#19e3c5;
+        --accent2:#4d7cff; --text:#e8eaed; --muted:#c0c7d0; }
+
+html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"],
+[data-testid="stToolbar"], [data-testid="stSidebar"] { background-color: var(--bg) !important; color: var(--text); }
+
+.block-container { padding-top: 2rem; max-width: 1500px; }
+
+h1 { background: linear-gradient(90deg, #19e3c5, #4d7cff, #b06bff);
+     -webkit-background-clip: text; -webkit-text-fill-color: transparent; font-weight: 800; }
+h2, h3, h4, h5 { color: #ffffff !important; }
+p, li, label, span, .stMarkdown, [data-testid="stCaptionContainer"] { color: var(--text); }
+[data-testid="stCaptionContainer"] * { color: var(--muted) !important; }
+hr { border-color: var(--border) !important; }
+
+/* Contenedores con borde */
+[data-testid="stVerticalBlockBorderWrapper"] { border-color: var(--border) !important; border-radius: 14px; }
+
+/* Métricas */
+[data-testid="stMetric"] { background: var(--panel); border: 1px solid var(--border);
+                           border-radius: 12px; padding: 12px 16px; }
+[data-testid="stMetricLabel"] * { color: var(--muted) !important; }
+[data-testid="stMetricValue"] { color: var(--accent) !important; }
+
+/* Botones */
+.stButton > button, .stDownloadButton > button {
+    border-radius: 10px !important; 
+    border: 1px solid #3a445d !important; /* Mismo borde visible para los botones */
+    background: #0f131b !important; 
+    color: var(--text) !important; 
+}
+
+.stButton > button:hover, .stDownloadButton > button:hover {
+    border-color: var(--accent) !important; /* Se ilumina en verde al pasar el ratón */
+    color: var(--accent) !important; 
+}
+
+/* Desplegables flotantes (popovers) */
+div[data-baseweb="popover"] ul, div[data-baseweb="popover"] > div { 
+    background-color: var(--panel) !important; 
+    border: 1px solid #3a445d !important;
+}
+
+span[data-baseweb="tag"] { 
+    background-color: #0f2f36 !important; 
+    color: var(--accent) !important; 
+}
+
+/* Inputs */
+/* Campos de texto, selectores, áreas de texto y uploader */
+div[data-baseweb="select"] > div, 
+div[data-baseweb="input"] > div, 
+textarea,
+[data-testid="stFileUploaderDropzone"] { 
+    background-color: var(--panel) !important;
+    border: 1px solid #3a445d !important; /* Borde gris claro y visible sobre fondo negro */
+    color: #ffffff !important; 
+}
+
+/* Forzar color de texto blanco y nítido dentro de los inputs */
+input, textarea, div[data-baseweb="select"] span {
+    color: #ffffff !important;
+}
+
+/* Texto secundario / placeholder */
+input::placeholder, textarea::placeholder {
+    color: #9ca3af !important; 
+}
+
+/* Pestañas */
+button[data-baseweb="tab"] { color: var(--muted); background: transparent; }
+button[data-baseweb="tab"][aria-selected="true"] { color: var(--accent); }
+div[data-baseweb="tab-highlight"] { background-color: var(--accent) !important; }
+div[data-baseweb="tab-border"] { background-color: var(--border) !important; }
+
+/* Código / secuencia */
+[data-testid="stCode"] pre, [data-testid="stCode"] code { background: var(--panel) !important; color: #b8f5e8 !important; }
+[data-testid="stAlert"] { background: var(--panel); border: 1px solid var(--border); }
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+AA_3TO1 = {
+    'ALA': 'A', 'CYS': 'C', 'ASP': 'D', 'GLU': 'E', 'PHE': 'F',
+    'GLY': 'G', 'HIS': 'H', 'ILE': 'I', 'LYS': 'K', 'LEU': 'L',
+    'MET': 'M', 'ASN': 'N', 'PRO': 'P', 'GLN': 'Q', 'ARG': 'R',
+    'SER': 'S', 'THR': 'T', 'VAL': 'V', 'TRP': 'W', 'TYR': 'Y',
+    'MSE': 'M',
+}
+WATER_NAMES = {"HOH", "WAT", "DOD", "H2O"}
+COMMON_IONS = {"NA", "CL", "K", "MG", "ZN", "CA", "FE", "CU", "MN", "SO4", "PO4", "EDTA"}
 
 
-def extract_rcsb_metadata(pdb_text):
-    """
-    Extrae metadatos detallados de los registros HEADER, TITLE, EXPDTA, JRNL, etc.
-    o estimaciones basadas en texto del PDB descargado de RCSB.
-    """
-    meta = {
-        "classification": "Desconocida",
-        "organism": "Desconocido",
-        "expression_system": "Desconocido",
-        "mutations": "Ninguna / No reportadas",
-        "method": "Desconocido",
-        "resolution": "No aplica / NMR o EM",
-        "is_membrane": False,
-        "membrane_clues": []
-    }
-    
-    if not pdb_text:
-        return meta
-
-    lines = pdb_text.splitlines()
-    
-    # Método de determinación y resolución
-    for line in lines:
-        if line.startswith("HEADER"):
-            meta["classification"] = line[10:50].strip()
-        elif line.startswith("EXPDTA"):
-            meta["method"] = line[6:].strip()
-        elif line.startswith("REMARK   2 RESOLUTION."):
-            res_match = re.search(r"([\d\.]+)\s+ANGSTROMS", line)
-            if res_match:
-                meta["resolution"] = f"{res_match.group(1)} Å"
-
-    full_text_upper = pdb_text.upper()
-    
-    # Búsqueda de organismo y sistema de expresión en registros SOURCE / COMPND
-    org_found, expr_found, mut_found = [], [], []
-    for line in lines:
-        if "ORGANISM_SCIENTIFIC:" in line:
-            org_found.append(line.split(":")[-1].strip().rstrip(";"))
-        if "EXPRESSION_SYSTEM:" in line:
-            expr_found.append(line.split(":")[-1].strip().rstrip(";"))
-        if "MUTATION:" in line or "MIP:" in line or "MUTAGENESIS" in line:
-            mut_found.append(line.strip())
-
-    if org_found:
-        meta["organism"] = ", ".join(set(org_found))
-    if expr_found:
-        meta["expression_system"] = ", ".join(set(expr_found))
-    if mut_found:
-        meta["mutations"] = " / ".join(set(mut_found[:3])) # Mostrar hasta 3
-
-    # Detección heurística de proteína de membrana
-    membrane_keywords = [
-        "MEMBRANE", "TRANSMEMBRANE", "G PROTEIN-COUPLED", "GPCR", "CHANNEL", 
-        "PUMP", "TRANSPORTER", "INTEGRAL MEMBRANE", "BETA BARREL", "RESPIRATORY CHAIN",
-        "PHOTOSYSTEM", "MITOCHONDRIAL", "UPTAKE", "EXCHANGER"
-    ]
-    
-    clues = []
-    for kw in membrane_keywords:
-        if kw in full_text_upper:
-            clues.append(kw)
-            
-    if clues or "ANTIMICROBIAL" in meta["classification"].upper():
-        meta["is_membrane"] = True
-        meta["membrane_clues"] = list(set(clues))[:4]
-
-    return meta
-
+# --- FUNCIONES AUXILIARES ---
 
 def fetch_pdb_from_web(pdb_code):
     if not pdb_code or len(pdb_code.strip()) != 4:
@@ -157,6 +179,24 @@ def fetch_pdb_from_web(pdb_code):
     except Exception:
         return None
     
+
+def extract_molecule_name(pdb_text, default_code="PROTEIN"):
+    """
+    Busca en el texto del PDB las líneas COMPND y extrae el valor del campo MOLECULE.
+    Ejemplo: COMPND   2 MOLECULE: HIV-1 PROTEASE; -> 'HIV-1 PROTEASE'
+    """
+    if not pdb_text:
+        return default_code.upper()
+    
+    # Buscar el patrón MOLECULE: <nombre>; dentro de los registros COMPND
+    match = re.search(r"COMPND(?:\s+\d+)?\s+MOLECULE:\s*([^;\n]+);?", pdb_text, re.IGNORECASE)
+    if match:
+        # Limpiar espacios extra y comillas si las hubiera
+        name = match.group(1).strip().strip('"\'')
+        return name
+    
+    return default_code.upper()
+
 
 def get_structure_heterogens(pdb_text):
     """Escanea el PDB y devuelve una lista ordenada de nombres de residuos no estándar (HETATM que no son agua)."""
@@ -401,202 +441,6 @@ def format_chain_block(residues, width=60):
         out.append(f"       {ss}")
         out.append("")
     return "\n".join(out)
-
-
-# ==============================================================================
-# 1. CONFIGURACIÓN DE PÁGINA Y CARGA DE DATOS STREAMLIT
-# ==============================================================================
-st.set_page_config(
-    page_title="BioDock Studio | Prep & Inspector",
-    page_icon="🧬",
-    layout="wide",
-)
-
-st.title("🧬 BioDock Studio: Inspector PDB & Preparación de Docking")
-
-# Cabecera persistente si la proteína ya está cargada
-if st.session_state.get("raw_pdb"):
-    p_name_display = st.session_state.get("pdb_name", "PROTEIN")
-    p_molecule_title = st.session_state.get("molecule_title", "Complejo Proteico")
-    st.markdown(f"### 🏷️ Estructura Activa: **`{p_name_display}`** — *{p_molecule_title}*")
-
-st.markdown("Herramienta bioinformática avanzada para visualización y preparación de complejos macromoleculares.")
-st.markdown("---")
-
-st.markdown("### 📥 1. Cargar Estructura Proteica")
-col_input1, col_input2 = st.columns([1, 2])
-
-with col_input1:
-    input_method = st.radio(
-        "Método de entrada:",
-        ["Código PDB (Ej. 1HSG, 4AKE)", "Subir archivo .pdb local"],
-        key="input_method"
-    )
-
-with col_input2:
-    if input_method == "Código PDB (Ej. 1HSG, 4AKE)":
-        def _trigger_fetch():
-            st.session_state["do_fetch_pdb"] = True
-
-        c_code, c_btn = st.columns([2, 1])
-        with c_code:
-            pdb_code = st.text_input(
-                "Código PDB:", 
-                value="1HSG", 
-                key="pdb_code_input",
-                on_change=_trigger_fetch
-            ).strip()
-            
-        with c_btn:
-            st.markdown("<br>", unsafe_allow_html=True)
-            btn_fetch = st.button("Buscar en RCSB", type="primary")
-
-        if btn_fetch or st.session_state.get("do_fetch_pdb", False):
-            st.session_state["do_fetch_pdb"] = False
-            
-            if pdb_code:
-                with st.spinner("Descargando estructura..."):
-                    data = fetch_pdb_from_web(pdb_code)
-                    if data:
-                        st.session_state["raw_pdb"] = data
-                        st.session_state["pdb_name"] = pdb_code.upper()
-                        protein_name = extract_molecule_name(data, default_code=pdb_code)
-                        st.session_state["molecule_title"] = protein_name
-                        st.success(f"¡Estructura de '{protein_name}' cargada con éxito!")
-                        st.rerun()
-                    else:
-                        st.error("Error al descargar el PDB.")
-                        
-    else:
-        uploaded_file = st.file_uploader("Sube tu archivo .pdb", type=["pdb"])
-        if uploaded_file is not None:
-            pdb_content = uploaded_file.getvalue().decode('utf-8', errors='ignore')
-            st.session_state["raw_pdb"] = pdb_content
-            st.session_state["pdb_name"] = uploaded_file.name.rsplit('.', 1)[0]
-            st.session_state["molecule_title"] = extract_molecule_name(pdb_content, default_code=uploaded_file.name)
-
-# ==============================================================================
-# 2. ESTILOS CSS Y DICCIONARIOS GLOBALES
-# ==============================================================================
-st.markdown(
-    """
-<style>
-:root { --bg:#000000; --panel:#0a0c10; --border:#1e2430; --accent:#19e3c5;
-        --accent2:#4d7cff; --text:#e8eaed; --muted:#c0c7d0; }
-
-html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"],
-[data-testid="stToolbar"], [data-testid="stSidebar"] { background-color: var(--bg) !important; color: var(--text); }
-
-.block-container { padding-top: 2rem; max-width: 1500px; }
-
-h1 { background: linear-gradient(90deg, #19e3c5, #4d7cff, #b06bff);
-     -webkit-background-clip: text; -webkit-text-fill-color: transparent; font-weight: 800; }
-h2, h3, h4, h5 { color: #ffffff !important; }
-p, li, label, span, .stMarkdown, [data-testid="stCaptionContainer"] { color: var(--text); }
-[data-testid="stCaptionContainer"] * { color: var(--muted) !important; }
-hr { border-color: var(--border) !important; }
-
-/* Contenedores con borde */
-[data-testid="stVerticalBlockBorderWrapper"] { border-color: var(--border) !important; border-radius: 14px; }
-
-/* Métricas */
-[data-testid="stMetric"] { background: var(--panel); border: 1px solid var(--border);
-                           border-radius: 12px; padding: 12px 16px; }
-[data-testid="stMetricLabel"] * { color: var(--muted) !important; }
-[data-testid="stMetricValue"] { color: var(--accent) !important; }
-
-/* Botones */
-.stButton > button, .stDownloadButton > button {
-    border-radius: 10px !important; 
-    border: 1px solid #3a445d !important; 
-    background: #0f131b !important; 
-    color: var(--text) !important; 
-}
-
-.stButton > button:hover, .stDownloadButton > button:hover {
-    border-color: var(--accent) !important; 
-    color: var(--accent) !important; 
-}
-
-/* Desplegables flotantes */
-div[data-baseweb="popover"] ul, div[data-baseweb="popover"] > div { 
-    background-color: var(--panel) !important; 
-    border: 1px solid #3a445d !important;
-}
-
-span[data-baseweb="tag"] { 
-    background-color: #0f2f36 !important; 
-    color: var(--accent) !important; 
-}
-
-/* Inputs */
-div[data-baseweb="select"] > div, 
-div[data-baseweb="input"] > div, 
-textarea,
-[data-testid="stFileUploaderDropzone"] { 
-    background-color: var(--panel) !important;
-    border: 1px solid #3a445d !important; 
-    color: #ffffff !important; 
-}
-
-input, textarea, div[data-baseweb="select"] span {
-    color: #ffffff !important;
-}
-
-input::placeholder, textarea::placeholder {
-    color: #9ca3af !important; 
-}
-
-/* Pestañas */
-button[data-baseweb="tab"] { color: var(--muted); background: transparent; }
-button[data-baseweb="tab"][aria-selected="true"] { color: var(--accent); }
-div[data-baseweb="tab-highlight"] { background-color: var(--accent) !important; }
-div[data-baseweb="tab-border"] { background-color: var(--border) !important; }
-
-/* Código / secuencia */
-[data-testid="stCode"] pre, [data-testid="stCode"] code { background: var(--panel) !important; color: #b8f5e8 !important; }
-[data-testid="stAlert"] { background: var(--panel); border: 1px solid var(--border); }
-</style>
-""",
-    unsafe_allow_html=True,
-)
-
-AA_3TO1 = {
-    'ALA': 'A', 'CYS': 'C', 'ASP': 'D', 'GLU': 'E', 'PHE': 'F',
-    'GLY': 'G', 'HIS': 'H', 'ILE': 'I', 'LYS': 'K', 'LEU': 'L',
-    'MET': 'M', 'ASN': 'N', 'PRO': 'P', 'GLN': 'Q', 'ARG': 'R',
-    'SER': 'S', 'THR': 'T', 'VAL': 'V', 'TRP': 'W', 'TYR': 'Y',
-    'MSE': 'M',
-}
-WATER_NAMES = {"HOH", "WAT", "DOD", "H2O"}
-COMMON_IONS = {"NA", "CL", "K", "MG", "ZN", "CA", "FE", "CU", "MN", "SO4", "PO4", "EDTA"}
-
-# ==============================================================================
-# 3. PREPARACIÓN DE VARIABLES Y RENDERIZADO DE PESTAÑAS (TABS)
-# ==============================================================================
-if st.session_state.get("raw_pdb"):
-    raw_pdb = st.session_state["raw_pdb"]
-    pdb_name = st.session_state.get("pdb_name", "Protein")
-    chain_summary = get_chain_summary(raw_pdb)
-    all_chains = list(chain_summary.keys())
-
-    st.markdown("---")
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-        "👁️ Visor 3D & Preparación", 
-        "📊 Propiedades Fisicoquímicas & Secuencia",
-        "🧪 Preparación Docking (Vina)", 
-        "🚀 Docking (Vina)",
-        "📈 Resultados de Docking", 
-        "🧬 GROMACS", 
-        "⚡ OpenMM"
-    ])
-
-    # A continuación continuas con:
-    # with tab1:
-    #     ...
-
-
-# --- FUNCIONES AUXILIARES ---
 
 
 # --- VISOR 3D ---
@@ -2911,7 +2755,73 @@ def build_openmm_package(p, protein_pdb, has_ligand=False):
     return files
 
 
-# ---PESTAÑAS ---
+# --- INTERFAZ STREAMLIT ---
+
+st.title("🧬 BioDock Studio: Inspector PDB & Preparación de Docking")
+st.markdown("Herramienta bioinformática avanzada para visualización y preparación de complejos macromoleculares.")
+st.markdown("---")
+
+st.markdown("### 📥 1. Cargar Estructura Proteica")
+col_input1, col_input2 = st.columns([1, 2])
+
+with col_input1:
+    input_method = st.radio("Método de entrada:",
+                            ["Código PDB (Ej. 1HSG, 4AKE)", "Subir archivo .pdb local"],
+                            key="input_method")
+
+with col_input2:
+    if input_method == "Código PDB (Ej. 1HSG, 4AKE)":
+        # Función callback para activar la búsqueda al pulsar Enter
+        def _trigger_fetch():
+            st.session_state["do_fetch_pdb"] = True
+
+        c_code, c_btn = st.columns([2, 1])
+        with c_code:
+            pdb_code = st.text_input(
+                "Código PDB:", 
+                value="1HSG", 
+                key="pdb_code_input",
+                on_change=_trigger_fetch
+            ).strip()
+            
+        with c_btn:
+            st.markdown("<br>", unsafe_allow_html=True)
+            btn_fetch = st.button("Buscar en RCSB", type="primary")
+
+        # Comprobamos si se pulsó el botón O si se activó el evento de Enter (on_change)
+        if btn_fetch or st.session_state.get("do_fetch_pdb", False):
+            # Reseteamos el flag de enter para que no se ejecute en bucles posteriores
+            st.session_state["do_fetch_pdb"] = False
+            
+            if pdb_code:
+                with st.spinner("Descargando estructura..."):
+                    data = fetch_pdb_from_web(pdb_code)
+                    if data:
+                        st.session_state["raw_pdb"] = data
+                        st.session_state["pdb_name"] = pdb_code.upper()
+                        protein_name = extract_molecule_name(data, default_code=pdb_code)
+                        st.success(f"¡Estructura de '{protein_name}' cargada con éxito!")
+                        st.rerun() # Actualiza la interfaz de inmediato
+                    else:
+                        st.error("Error al descargar el PDB.")
+                        
+    else:
+        uploaded_file = st.file_uploader("Sube tu archivo .pdb", type=["pdb"])
+        if uploaded_file is not None:
+            # getvalue() (no read()): read() devuelve vacío en las recargas siguientes
+            st.session_state["raw_pdb"] = uploaded_file.getvalue().decode('utf-8', errors='ignore')
+            st.session_state["pdb_name"] = uploaded_file.name.rsplit('.', 1)[0]
+
+if st.session_state.get("raw_pdb"):
+    raw_pdb = st.session_state["raw_pdb"]
+    pdb_name = st.session_state.get("pdb_name", "Protein")
+    chain_summary = get_chain_summary(raw_pdb)
+    all_chains = list(chain_summary.keys())
+
+    st.markdown("---")
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(["👁️ Visor 3D & Preparación", "📊 Propiedades Fisicoquímicas & Secuencia",
+                                                  "🧪 Preparación Docking (Vina)", "🚀 Docking (Vina)",
+                                                  "📈 Resultados de Docking", "🧬 GROMACS", "⚡ OpenMM"])
 
     with tab1:
         col_vis, col_panel = st.columns([1.5, 1])
@@ -3139,34 +3049,10 @@ def build_openmm_package(p, protein_pdb, has_ligand=False):
                         st.caption(pse_desc)
 
     with tab2:
-        st.markdown("### 📊 Propiedades Fisicoquímicas, Metadatos RCSB y Secuencia")
+        st.markdown("### 📊 Propiedades Fisicoquímicas y Secuencia Primaria")
         chains = result["chains"]
 
         if chains:
-            # --- NUEVA SECCIÓN: METADATOS CRISTALOGRÁFICOS / RCSB ---
-            rcsb_meta = extract_rcsb_metadata(raw_pdb)
-            
-            st.markdown("#### 🏛️ Información Cristalográfica / RCSB PDB")
-            meta_c1, meta_c2, meta_c3 = st.columns(3)
-            with meta_c1:
-                st.markdown(f"**Clasificación:** `{rcsb_meta['classification']}`")
-                st.markdown(f"**Método de determinación:** `{rcsb_meta['method']}`")
-            with meta_c2:
-                st.markdown(f"**Organismo:** `{rcsb_meta['organism']}`")
-                st.markdown(f"**Resolución:** `{rcsb_meta['resolution']}`")
-            with meta_c3:
-                st.markdown(f"**Sistema de expresión:** `{rcsb_meta['expression_system']}`")
-                st.markdown(f"**Mutaciones reportadas:** `{rcsb_meta['mutations']}`")
-
-            # Indicador de proteína de membrana
-            if rcsb_meta["is_membrane"]:
-                clues_str = ", ".join(rcsb_meta["membrane_clues"]) if rcsb_meta["membrane_clues"] else "anotación funcional"
-                st.info(f"🌐 **Predicción de tipo de proteína:** Clasificada probablemente como **Proteína de Membrana** (indicios detectados: *{clues_str}*). Ten en cuenta que para simulaciones de dinámica molecular requerirá una balsa lipídica o membrana bicapa.")
-            else:
-                st.success("💧 **Predicción de tipo de proteína:** Proteína globular / soluble estándar (no se han detectado marcadores típicos de membrana en los registros del PDB).")
-
-            st.markdown("---")
-
             chain_id = st.selectbox("Seleccionar Cadena para análisis:", list(chains.keys()),
                                     key=f"tab2_chain_{pdb_name}")
             residues = chains[chain_id]
