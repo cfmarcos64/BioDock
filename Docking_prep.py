@@ -61,12 +61,171 @@ except Exception:
 HAS_PLIP = HAS_OB and importlib.util.find_spec("plip") is not None
 HAS_PDB2PQR = all(importlib.util.find_spec(m) is not None for m in ("pdb2pqr", "propka"))
 
+
+def extract_molecule_name(pdb_text, default_code="PROTEIN"):
+    """
+    Busca en el texto del PDB las líneas COMPND y extrae el valor del campo MOLECULE.
+    """
+    if not pdb_text:
+        return default_code.upper()
+    
+    match = re.search(r"COMPND(?:\s+\d+)?\s+MOLECULE:\s*([^;\n]+);?", pdb_text, re.IGNORECASE)
+    if match:
+        return match.group(1).strip().strip('"\'')
+    
+    return default_code.upper()
+
+
+def extract_rcsb_metadata(pdb_text):
+    """
+    Extrae metadatos detallados de los registros HEADER, TITLE, EXPDTA, JRNL, etc.
+    o estimaciones basadas en texto del PDB descargado de RCSB.
+    """
+    meta = {
+        "classification": "Desconocida",
+        "organism": "Desconocido",
+        "expression_system": "Desconocido",
+        "mutations": "Ninguna / No reportadas",
+        "method": "Desconocido",
+        "resolution": "No aplica / NMR o EM",
+        "is_membrane": False,
+        "membrane_clues": []
+    }
+    
+    if not pdb_text:
+        return meta
+
+    lines = pdb_text.splitlines()
+    
+    # Método de determinación y resolución
+    for line in lines:
+        if line.startswith("HEADER"):
+            meta["classification"] = line[10:50].strip()
+        elif line.startswith("EXPDTA"):
+            meta["method"] = line[6:].strip()
+        elif line.startswith("REMARK   2 RESOLUTION."):
+            res_match = re.search(r"([\d\.]+)\s+ANGSTROMS", line)
+            if res_match:
+                meta["resolution"] = f"{res_match.group(1)} Å"
+
+    full_text_upper = pdb_text.upper()
+    
+    # Búsqueda de organismo y sistema de expresión en registros SOURCE / COMPND
+    org_found, expr_found, mut_found = [], [], []
+    for line in lines:
+        if "ORGANISM_SCIENTIFIC:" in line:
+            org_found.append(line.split(":")[-1].strip().rstrip(";"))
+        if "EXPRESSION_SYSTEM:" in line:
+            expr_found.append(line.split(":")[-1].strip().rstrip(";"))
+        if "MUTATION:" in line or "MIP:" in line or "MUTAGENESIS" in line:
+            mut_found.append(line.strip())
+
+    if org_found:
+        meta["organism"] = ", ".join(set(org_found))
+    if expr_found:
+        meta["expression_system"] = ", ".join(set(expr_found))
+    if mut_found:
+        meta["mutations"] = " / ".join(set(mut_found[:3])) # Mostrar hasta 3
+
+    # Detección heurística de proteína de membrana
+    membrane_keywords = [
+        "MEMBRANE", "TRANSMEMBRANE", "G PROTEIN-COUPLED", "GPCR", "CHANNEL", 
+        "PUMP", "TRANSPORTER", "INTEGRAL MEMBRANE", "BETA BARREL", "RESPIRATORY CHAIN",
+        "PHOTOSYSTEM", "MITOCHONDRIAL", "UPTAKE", "EXCHANGER"
+    ]
+    
+    clues = []
+    for kw in membrane_keywords:
+        if kw in full_text_upper:
+            clues.append(kw)
+            
+    if clues or "ANTIMICROBIAL" in meta["classification"].upper():
+        meta["is_membrane"] = True
+        meta["membrane_clues"] = list(set(clues))[:4]
+
+    return meta
+
+
+def fetch_pdb_from_web(pdb_code):
+    if not pdb_code or len(pdb_code.strip()) != 4:
+        return None
+    url = f"https://files.rcsb.org/download/{pdb_code.strip().upper()}.pdb"
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=20) as response:
+            return response.read().decode('utf-8', errors='ignore')
+    except Exception:
+        return None
+    
+
+
 # --- CONFIGURACIÓN DE PÁGINA STREAMLIT ---
 st.set_page_config(
     page_title="BioDock Studio | Prep & Inspector",
     page_icon="🧬",
     layout="wide",
 )
+
+st.title("🧬 BioDock Studio: Inspector PDB & Preparación de Docking")
+
+# Cabecera persistente del nombre de la proteína activa si ya está cargada
+if st.session_state.get("raw_pdb"):
+    p_name_display = st.session_state.get("pdb_name", "PROTEIN")
+    p_molecule_title = st.session_state.get("molecule_title", "Complejo Proteico")
+    st.markdown(f"### 🏷️ Estructura Activa: **`{p_name_display}`** — *{p_molecule_title}*")
+
+st.markdown("Herramienta bioinformática avanzada para visualización y preparación de complejos macromoleculares.")
+st.markdown("---")
+
+st.markdown("### 📥 1. Cargar Estructura Proteica")
+col_input1, col_input2 = st.columns([1, 2])
+
+with col_input1:
+    input_method = st.radio("Método de entrada:",
+                            ["Código PDB (Ej. 1HSG, 4AKE)", "Subir archivo .pdb local"],
+                            key="input_method")
+
+with col_input2:
+    if input_method == "Código PDB (Ej. 1HSG, 4AKE)":
+        def _trigger_fetch():
+            st.session_state["do_fetch_pdb"] = True
+
+        c_code, c_btn = st.columns([2, 1])
+        with c_code:
+            pdb_code = st.text_input(
+                "Código PDB:", 
+                value="1HSG", 
+                key="pdb_code_input",
+                on_change=_trigger_fetch
+            ).strip()
+            
+        with c_btn:
+            st.markdown("<br>", unsafe_allow_html=True)
+            btn_fetch = st.button("Buscar en RCSB", type="primary")
+
+        if btn_fetch or st.session_state.get("do_fetch_pdb", False):
+            st.session_state["do_fetch_pdb"] = False
+            
+            if pdb_code:
+                with st.spinner("Descargando estructura..."):
+                    data = fetch_pdb_from_web(pdb_code)
+                    if data:
+                        st.session_state["raw_pdb"] = data
+                        st.session_state["pdb_name"] = pdb_code.upper()
+                        # Guardar el nombre oficial extraído de los registros COMPND
+                        st.session_state["molecule_title"] = extract_molecule_name(data, default_code=pdb_code)
+                        st.success(f"¡Estructura cargada con éxito!")
+                        st.rerun()
+                    else:
+                        st.error("Error al descargar el PDB.")
+                        
+    else:
+        uploaded_file = st.file_uploader("Sube tu archivo .pdb", type=["pdb"])
+        if uploaded_file is not None:
+            pdb_content = uploaded_file.getvalue().decode('utf-8', errors='ignore')
+            st.session_state["raw_pdb"] = pdb_content
+            st.session_state["pdb_name"] = uploaded_file.name.rsplit('.', 1)[0]
+            st.session_state["molecule_title"] = extract_molecule_name(pdb_content, default_code=uploaded_file.name)
 
 # --- TEMA NEGRO (CSS) ---
 st.markdown(
@@ -167,36 +326,6 @@ COMMON_IONS = {"NA", "CL", "K", "MG", "ZN", "CA", "FE", "CU", "MN", "SO4", "PO4"
 
 
 # --- FUNCIONES AUXILIARES ---
-
-def fetch_pdb_from_web(pdb_code):
-    if not pdb_code or len(pdb_code.strip()) != 4:
-        return None
-    url = f"https://files.rcsb.org/download/{pdb_code.strip().upper()}.pdb"
-    try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=20) as response:
-            return response.read().decode('utf-8', errors='ignore')
-    except Exception:
-        return None
-    
-
-def extract_molecule_name(pdb_text, default_code="PROTEIN"):
-    """
-    Busca en el texto del PDB las líneas COMPND y extrae el valor del campo MOLECULE.
-    Ejemplo: COMPND   2 MOLECULE: HIV-1 PROTEASE; -> 'HIV-1 PROTEASE'
-    """
-    if not pdb_text:
-        return default_code.upper()
-    
-    # Buscar el patrón MOLECULE: <nombre>; dentro de los registros COMPND
-    match = re.search(r"COMPND(?:\s+\d+)?\s+MOLECULE:\s*([^;\n]+);?", pdb_text, re.IGNORECASE)
-    if match:
-        # Limpiar espacios extra y comillas si las hubiera
-        name = match.group(1).strip().strip('"\'')
-        return name
-    
-    return default_code.upper()
-
 
 def get_structure_heterogens(pdb_text):
     """Escanea el PDB y devuelve una lista ordenada de nombres de residuos no estándar (HETATM que no son agua)."""
@@ -3049,10 +3178,34 @@ if st.session_state.get("raw_pdb"):
                         st.caption(pse_desc)
 
     with tab2:
-        st.markdown("### 📊 Propiedades Fisicoquímicas y Secuencia Primaria")
+        st.markdown("### 📊 Propiedades Fisicoquímicas, Metadatos RCSB y Secuencia")
         chains = result["chains"]
 
         if chains:
+            # --- NUEVA SECCIÓN: METADATOS CRISTALOGRÁFICOS / RCSB ---
+            rcsb_meta = extract_rcsb_metadata(raw_pdb)
+            
+            st.markdown("#### 🏛️ Información Cristalográfica / RCSB PDB")
+            meta_c1, meta_c2, meta_c3 = st.columns(3)
+            with meta_c1:
+                st.markdown(f"**Clasificación:** `{rcsb_meta['classification']}`")
+                st.markdown(f"**Método de determinación:** `{rcsb_meta['method']}`")
+            with meta_c2:
+                st.markdown(f"**Organismo:** `{rcsb_meta['organism']}`")
+                st.markdown(f"**Resolución:** `{rcsb_meta['resolution']}`")
+            with meta_c3:
+                st.markdown(f"**Sistema de expresión:** `{rcsb_meta['expression_system']}`")
+                st.markdown(f"**Mutaciones reportadas:** `{rcsb_meta['mutations']}`")
+
+            # Indicador de proteína de membrana
+            if rcsb_meta["is_membrane"]:
+                clues_str = ", ".join(rcsb_meta["membrane_clues"]) if rcsb_meta["membrane_clues"] else "anotación funcional"
+                st.info(f"🌐 **Predicción de tipo de proteína:** Clasificada probablemente como **Proteína de Membrana** (indicios detectados: *{clues_str}*). Ten en cuenta que para simulaciones de dinámica molecular requerirá una balsa lipídica o membrana bicapa.")
+            else:
+                st.success("💧 **Predicción de tipo de proteína:** Proteína globular / soluble estándar (no se han detectado marcadores típicos de membrana en los registros del PDB).")
+
+            st.markdown("---")
+
             chain_id = st.selectbox("Seleccionar Cadena para análisis:", list(chains.keys()),
                                     key=f"tab2_chain_{pdb_name}")
             residues = chains[chain_id]
