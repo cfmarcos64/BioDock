@@ -61,112 +61,93 @@ except Exception:
 HAS_PLIP = HAS_OB and importlib.util.find_spec("plip") is not None
 HAS_PDB2PQR = all(importlib.util.find_spec(m) is not None for m in ("pdb2pqr", "propka"))
 
-# --- CONFIGURACIÓN DE PÁGINA STREAMLIT ---
-st.set_page_config(
-    page_title="BioDock Studio | Prep & Inspector",
-    page_icon="🧬",
-    layout="wide",
-)
-
-# --- TEMA NEGRO (CSS) ---
-st.markdown(
-    """
-<style>
-:root { --bg:#000000; --panel:#0a0c10; --border:#1e2430; --accent:#19e3c5;
-        --accent2:#4d7cff; --text:#e8eaed; --muted:#c0c7d0; }
-
-html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"],
-[data-testid="stToolbar"], [data-testid="stSidebar"] { background-color: var(--bg) !important; color: var(--text); }
-
-.block-container { padding-top: 2rem; max-width: 1500px; }
-
-h1 { background: linear-gradient(90deg, #19e3c5, #4d7cff, #b06bff);
-     -webkit-background-clip: text; -webkit-text-fill-color: transparent; font-weight: 800; }
-h2, h3, h4, h5 { color: #ffffff !important; }
-p, li, label, span, .stMarkdown, [data-testid="stCaptionContainer"] { color: var(--text); }
-[data-testid="stCaptionContainer"] * { color: var(--muted) !important; }
-hr { border-color: var(--border) !important; }
-
-/* Contenedores con borde */
-[data-testid="stVerticalBlockBorderWrapper"] { border-color: var(--border) !important; border-radius: 14px; }
-
-/* Métricas */
-[data-testid="stMetric"] { background: var(--panel); border: 1px solid var(--border);
-                           border-radius: 12px; padding: 12px 16px; }
-[data-testid="stMetricLabel"] * { color: var(--muted) !important; }
-[data-testid="stMetricValue"] { color: var(--accent) !important; }
-
-/* Botones */
-.stButton > button, .stDownloadButton > button {
-    border-radius: 10px !important; 
-    border: 1px solid #3a445d !important; /* Mismo borde visible para los botones */
-    background: #0f131b !important; 
-    color: var(--text) !important; 
-}
-
-.stButton > button:hover, .stDownloadButton > button:hover {
-    border-color: var(--accent) !important; /* Se ilumina en verde al pasar el ratón */
-    color: var(--accent) !important; 
-}
-
-/* Desplegables flotantes (popovers) */
-div[data-baseweb="popover"] ul, div[data-baseweb="popover"] > div { 
-    background-color: var(--panel) !important; 
-    border: 1px solid #3a445d !important;
-}
-
-span[data-baseweb="tag"] { 
-    background-color: #0f2f36 !important; 
-    color: var(--accent) !important; 
-}
-
-/* Inputs */
-/* Campos de texto, selectores, áreas de texto y uploader */
-div[data-baseweb="select"] > div, 
-div[data-baseweb="input"] > div, 
-textarea,
-[data-testid="stFileUploaderDropzone"] { 
-    background-color: var(--panel) !important;
-    border: 1px solid #3a445d !important; /* Borde gris claro y visible sobre fondo negro */
-    color: #ffffff !important; 
-}
-
-/* Forzar color de texto blanco y nítido dentro de los inputs */
-input, textarea, div[data-baseweb="select"] span {
-    color: #ffffff !important;
-}
-
-/* Texto secundario / placeholder */
-input::placeholder, textarea::placeholder {
-    color: #9ca3af !important; 
-}
-
-/* Pestañas */
-button[data-baseweb="tab"] { color: var(--muted); background: transparent; }
-button[data-baseweb="tab"][aria-selected="true"] { color: var(--accent); }
-div[data-baseweb="tab-highlight"] { background-color: var(--accent) !important; }
-div[data-baseweb="tab-border"] { background-color: var(--border) !important; }
-
-/* Código / secuencia */
-[data-testid="stCode"] pre, [data-testid="stCode"] code { background: var(--panel) !important; color: #b8f5e8 !important; }
-[data-testid="stAlert"] { background: var(--panel); border: 1px solid var(--border); }
-</style>
-""",
-    unsafe_allow_html=True,
-)
-
-AA_3TO1 = {
-    'ALA': 'A', 'CYS': 'C', 'ASP': 'D', 'GLU': 'E', 'PHE': 'F',
-    'GLY': 'G', 'HIS': 'H', 'ILE': 'I', 'LYS': 'K', 'LEU': 'L',
-    'MET': 'M', 'ASN': 'N', 'PRO': 'P', 'GLN': 'Q', 'ARG': 'R',
-    'SER': 'S', 'THR': 'T', 'VAL': 'V', 'TRP': 'W', 'TYR': 'Y',
-    'MSE': 'M',
-}
-WATER_NAMES = {"HOH", "WAT", "DOD", "H2O"}
-COMMON_IONS = {"NA", "CL", "K", "MG", "ZN", "CA", "FE", "CU", "MN", "SO4", "PO4", "EDTA"}
 
 
 # --- FUNCIONES AUXILIARES ---
+
+def extract_molecule_name(pdb_text, default_code="PROTEIN"):
+    """
+    Busca en el texto del PDB las líneas COMPND y extrae el valor del campo MOLECULE.
+    """
+    if not pdb_text:
+        return default_code.upper()
+    
+    match = re.search(r"COMPND(?:\s+\d+)?\s+MOLECULE:\s*([^;\n]+);?", pdb_text, re.IGNORECASE)
+    if match:
+        return match.group(1).strip().strip('"\'')
+    
+    return default_code.upper()
+
+
+def extract_rcsb_metadata(pdb_text):
+    """
+    Extrae metadatos detallados de los registros HEADER, TITLE, EXPDTA, JRNL, etc.
+    o estimaciones basadas en texto del PDB descargado de RCSB.
+    """
+    meta = {
+        "classification": "Desconocida",
+        "organism": "Desconocido",
+        "expression_system": "Desconocido",
+        "mutations": "Ninguna / No reportadas",
+        "method": "Desconocido",
+        "resolution": "No aplica / NMR o EM",
+        "is_membrane": False,
+        "membrane_clues": []
+    }
+    
+    if not pdb_text:
+        return meta
+
+    lines = pdb_text.splitlines()
+    
+    # Método de determinación y resolución
+    for line in lines:
+        if line.startswith("HEADER"):
+            meta["classification"] = line[10:50].strip()
+        elif line.startswith("EXPDTA"):
+            meta["method"] = line[6:].strip()
+        elif line.startswith("REMARK   2 RESOLUTION."):
+            res_match = re.search(r"([\d\.]+)\s+ANGSTROMS", line)
+            if res_match:
+                meta["resolution"] = f"{res_match.group(1)} Å"
+
+    full_text_upper = pdb_text.upper()
+    
+    # Búsqueda de organismo y sistema de expresión en registros SOURCE / COMPND
+    org_found, expr_found, mut_found = [], [], []
+    for line in lines:
+        if "ORGANISM_SCIENTIFIC:" in line:
+            org_found.append(line.split(":")[-1].strip().rstrip(";"))
+        if "EXPRESSION_SYSTEM:" in line:
+            expr_found.append(line.split(":")[-1].strip().rstrip(";"))
+        if "MUTATION:" in line or "MIP:" in line or "MUTAGENESIS" in line:
+            mut_found.append(line.strip())
+
+    if org_found:
+        meta["organism"] = ", ".join(set(org_found))
+    if expr_found:
+        meta["expression_system"] = ", ".join(set(expr_found))
+    if mut_found:
+        meta["mutations"] = " / ".join(set(mut_found[:3])) # Mostrar hasta 3
+
+    # Detección heurística de proteína de membrana
+    membrane_keywords = [
+        "MEMBRANE", "TRANSMEMBRANE", "G PROTEIN-COUPLED", "GPCR", "CHANNEL", 
+        "PUMP", "TRANSPORTER", "INTEGRAL MEMBRANE", "BETA BARREL", "RESPIRATORY CHAIN",
+        "PHOTOSYSTEM", "MITOCHONDRIAL", "UPTAKE", "EXCHANGER"
+    ]
+    
+    clues = []
+    for kw in membrane_keywords:
+        if kw in full_text_upper:
+            clues.append(kw)
+            
+    if clues or "ANTIMICROBIAL" in meta["classification"].upper():
+        meta["is_membrane"] = True
+        meta["membrane_clues"] = list(set(clues))[:4]
+
+    return meta
+
 
 def fetch_pdb_from_web(pdb_code):
     if not pdb_code or len(pdb_code.strip()) != 4:
@@ -179,24 +160,6 @@ def fetch_pdb_from_web(pdb_code):
     except Exception:
         return None
     
-
-def extract_molecule_name(pdb_text, default_code="PROTEIN"):
-    """
-    Busca en el texto del PDB las líneas COMPND y extrae el valor del campo MOLECULE.
-    Ejemplo: COMPND   2 MOLECULE: HIV-1 PROTEASE; -> 'HIV-1 PROTEASE'
-    """
-    if not pdb_text:
-        return default_code.upper()
-    
-    # Buscar el patrón MOLECULE: <nombre>; dentro de los registros COMPND
-    match = re.search(r"COMPND(?:\s+\d+)?\s+MOLECULE:\s*([^;\n]+);?", pdb_text, re.IGNORECASE)
-    if match:
-        # Limpiar espacios extra y comillas si las hubiera
-        name = match.group(1).strip().strip('"\'')
-        return name
-    
-    return default_code.upper()
-
 
 def get_structure_heterogens(pdb_text):
     """Escanea el PDB y devuelve una lista ordenada de nombres de residuos no estándar (HETATM que no son agua)."""
@@ -1541,16 +1504,16 @@ def render_ligand_results(results, pdb_name, prefix, kind="ext"):
         st.dataframe([{"Ligando": x["name"], "Átomos": x.get("n_atoms"), "Carga neta": x.get("net_charge"),
                        "Torsiones": x.get("torsions"),
                        "Estado": "✅" if x.get("ok") else "❌ " + x.get("error", "")} for x in results],
-                     hide_index=True, use_container_width=True)
+                     hide_index=True, width='stretch')
         if ok:
             st.download_button("📦 Todos los PDBQT (.zip)",
                                zip_files({f"{x['name']}.pdbqt": x["pdbqt"] for x in ok}),
                                file_name=f"{pdb_name}_ligandos_pdbqt.zip", mime="application/zip",
-                               type="primary", use_container_width=True, key=f"{prefix}_zip_qt")
+                               type="primary", width='stretch', key=f"{prefix}_zip_qt")
             st.download_button("📦 Todos los SDF (.zip)",
                                zip_files({f"{x['name']}.sdf": x["sdf"] for x in ok}),
                                file_name=f"{pdb_name}_ligandos_sdf.zip", mime="application/zip",
-                               use_container_width=True, key=f"{prefix}_zip_sdf")
+                               width='stretch', key=f"{prefix}_zip_sdf")
             chosen = st.selectbox("Ver / descargar uno:", [x["name"] for x in ok], key=f"{prefix}_sel")
             r = next(x for x in ok if x["name"] == chosen)
     elif bad:
@@ -1565,12 +1528,12 @@ def render_ligand_results(results, pdb_name, prefix, kind="ext"):
         c.metric("Torsiones", r["torsions"] if r["torsions"] is not None else "—")
         st.caption(f"PDBQT generado con {r['engine']} · cargas Gasteiger")
         st.download_button("📥 Ligando (.sdf, con H a pH)", r["sdf"].encode(), file_name=f"{r['name']}.sdf",
-                           type="primary" if len(results) == 1 else "secondary", use_container_width=True,
+                           type="primary" if len(results) == 1 else "secondary", width='stretch',
                            key=f"{prefix}_sdf")
         st.download_button("📥 Ligando (.pdbqt)", r["pdbqt"].encode(), file_name=f"{r['name']}.pdbqt",
-                           use_container_width=True, key=f"{prefix}_qt")
+                           width='stretch', key=f"{prefix}_qt")
         st.download_button("📥 Ligando (.pdb con H)", r["pdb"].encode(), file_name=f"{r['name']}_H.pdb",
-                           use_container_width=True, key=f"{prefix}_pdb")
+                           width='stretch', key=f"{prefix}_pdb")
 
 
 
@@ -2754,10 +2717,23 @@ def build_openmm_package(p, protein_pdb, has_ligand=False):
     }
     return files
 
-
-# --- INTERFAZ STREAMLIT ---
+# ==============================================================================
+# 1. CONFIGURACIÓN DE PÁGINA Y CARGA DE DATOS STREAMLIT
+# ==============================================================================
+st.set_page_config(
+    page_title="BioDock Studio | Prep & Inspector",
+    page_icon="🧬",
+    layout="wide",
+)
 
 st.title("🧬 BioDock Studio: Inspector PDB & Preparación de Docking")
+
+# Cabecera persistente si la proteína ya está cargada
+if st.session_state.get("raw_pdb"):
+    p_name_display = st.session_state.get("pdb_name", "PROTEIN")
+    p_molecule_title = st.session_state.get("molecule_title", "Complejo Proteico")
+    st.markdown(f"### 🏷️ Estructura Activa: **`{p_name_display}`** — *{p_molecule_title}*")
+
 st.markdown("Herramienta bioinformática avanzada para visualización y preparación de complejos macromoleculares.")
 st.markdown("---")
 
@@ -2765,13 +2741,14 @@ st.markdown("### 📥 1. Cargar Estructura Proteica")
 col_input1, col_input2 = st.columns([1, 2])
 
 with col_input1:
-    input_method = st.radio("Método de entrada:",
-                            ["Código PDB (Ej. 1HSG, 4AKE)", "Subir archivo .pdb local"],
-                            key="input_method")
+    input_method = st.radio(
+        "Método de entrada:",
+        ["Código PDB (Ej. 1HSG, 4AKE)", "Subir archivo .pdb local"],
+        key="input_method"
+    )
 
 with col_input2:
     if input_method == "Código PDB (Ej. 1HSG, 4AKE)":
-        # Función callback para activar la búsqueda al pulsar Enter
         def _trigger_fetch():
             st.session_state["do_fetch_pdb"] = True
 
@@ -2788,9 +2765,7 @@ with col_input2:
             st.markdown("<br>", unsafe_allow_html=True)
             btn_fetch = st.button("Buscar en RCSB", type="primary")
 
-        # Comprobamos si se pulsó el botón O si se activó el evento de Enter (on_change)
         if btn_fetch or st.session_state.get("do_fetch_pdb", False):
-            # Reseteamos el flag de enter para que no se ejecute en bucles posteriores
             st.session_state["do_fetch_pdb"] = False
             
             if pdb_code:
@@ -2800,18 +2775,119 @@ with col_input2:
                         st.session_state["raw_pdb"] = data
                         st.session_state["pdb_name"] = pdb_code.upper()
                         protein_name = extract_molecule_name(data, default_code=pdb_code)
+                        st.session_state["molecule_title"] = protein_name
                         st.success(f"¡Estructura de '{protein_name}' cargada con éxito!")
-                        st.rerun() # Actualiza la interfaz de inmediato
+                        st.rerun()
                     else:
                         st.error("Error al descargar el PDB.")
                         
     else:
         uploaded_file = st.file_uploader("Sube tu archivo .pdb", type=["pdb"])
         if uploaded_file is not None:
-            # getvalue() (no read()): read() devuelve vacío en las recargas siguientes
-            st.session_state["raw_pdb"] = uploaded_file.getvalue().decode('utf-8', errors='ignore')
+            pdb_content = uploaded_file.getvalue().decode('utf-8', errors='ignore')
+            st.session_state["raw_pdb"] = pdb_content
             st.session_state["pdb_name"] = uploaded_file.name.rsplit('.', 1)[0]
+            st.session_state["molecule_title"] = extract_molecule_name(pdb_content, default_code=uploaded_file.name)
 
+# ==============================================================================
+# 2. ESTILOS CSS Y DICCIONARIOS GLOBALES
+# ==============================================================================
+st.markdown(
+    """
+<style>
+:root { --bg:#000000; --panel:#0a0c10; --border:#1e2430; --accent:#19e3c5;
+        --accent2:#4d7cff; --text:#e8eaed; --muted:#c0c7d0; }
+
+html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"],
+[data-testid="stToolbar"], [data-testid="stSidebar"] { background-color: var(--bg) !important; color: var(--text); }
+
+.block-container { padding-top: 2rem; max-width: 1500px; }
+
+h1 { background: linear-gradient(90deg, #19e3c5, #4d7cff, #b06bff);
+     -webkit-background-clip: text; -webkit-text-fill-color: transparent; font-weight: 800; }
+h2, h3, h4, h5 { color: #ffffff !important; }
+p, li, label, span, .stMarkdown, [data-testid="stCaptionContainer"] { color: var(--text); }
+[data-testid="stCaptionContainer"] * { color: var(--muted) !important; }
+hr { border-color: var(--border) !important; }
+
+/* Contenedores con borde */
+[data-testid="stVerticalBlockBorderWrapper"] { border-color: var(--border) !important; border-radius: 14px; }
+
+/* Métricas */
+[data-testid="stMetric"] { background: var(--panel); border: 1px solid var(--border);
+                           border-radius: 12px; padding: 12px 16px; }
+[data-testid="stMetricLabel"] * { color: var(--muted) !important; }
+[data-testid="stMetricValue"] { color: var(--accent) !important; }
+
+/* Botones */
+.stButton > button, .stDownloadButton > button {
+    border-radius: 10px !important; 
+    border: 1px solid #3a445d !important; 
+    background: #0f131b !important; 
+    color: var(--text) !important; 
+}
+
+.stButton > button:hover, .stDownloadButton > button:hover {
+    border-color: var(--accent) !important; 
+    color: var(--accent) !important; 
+}
+
+/* Desplegables flotantes */
+div[data-baseweb="popover"] ul, div[data-baseweb="popover"] > div { 
+    background-color: var(--panel) !important; 
+    border: 1px solid #3a445d !important;
+}
+
+span[data-baseweb="tag"] { 
+    background-color: #0f2f36 !important; 
+    color: var(--accent) !important; 
+}
+
+/* Inputs */
+div[data-baseweb="select"] > div, 
+div[data-baseweb="input"] > div, 
+textarea,
+[data-testid="stFileUploaderDropzone"] { 
+    background-color: var(--panel) !important;
+    border: 1px solid #3a445d !important; 
+    color: #ffffff !important; 
+}
+
+input, textarea, div[data-baseweb="select"] span {
+    color: #ffffff !important;
+}
+
+input::placeholder, textarea::placeholder {
+    color: #9ca3af !important; 
+}
+
+/* Pestañas */
+button[data-baseweb="tab"] { color: var(--muted); background: transparent; }
+button[data-baseweb="tab"][aria-selected="true"] { color: var(--accent); }
+div[data-baseweb="tab-highlight"] { background-color: var(--accent) !important; }
+div[data-baseweb="tab-border"] { background-color: var(--border) !important; }
+
+/* Código / secuencia */
+[data-testid="stCode"] pre, [data-testid="stCode"] code { background: var(--panel) !important; color: #b8f5e8 !important; }
+[data-testid="stAlert"] { background: var(--panel); border: 1px solid var(--border); }
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+AA_3TO1 = {
+    'ALA': 'A', 'CYS': 'C', 'ASP': 'D', 'GLU': 'E', 'PHE': 'F',
+    'GLY': 'G', 'HIS': 'H', 'ILE': 'I', 'LYS': 'K', 'LEU': 'L',
+    'MET': 'M', 'ASN': 'N', 'PRO': 'P', 'GLN': 'Q', 'ARG': 'R',
+    'SER': 'S', 'THR': 'T', 'VAL': 'V', 'TRP': 'W', 'TYR': 'Y',
+    'MSE': 'M',
+}
+WATER_NAMES = {"HOH", "WAT", "DOD", "H2O"}
+COMMON_IONS = {"NA", "CL", "K", "MG", "ZN", "CA", "FE", "CU", "MN", "SO4", "PO4", "EDTA"}
+
+# ==============================================================================
+# 3. PREPARACIÓN DE VARIABLES Y RENDERIZADO DE PESTAÑAS (TABS)
+# ==============================================================================
 if st.session_state.get("raw_pdb"):
     raw_pdb = st.session_state["raw_pdb"]
     pdb_name = st.session_state.get("pdb_name", "Protein")
@@ -2819,9 +2895,18 @@ if st.session_state.get("raw_pdb"):
     all_chains = list(chain_summary.keys())
 
     st.markdown("---")
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(["👁️ Visor 3D & Preparación", "📊 Propiedades Fisicoquímicas & Secuencia",
-                                                  "🧪 Preparación Docking (Vina)", "🚀 Docking (Vina)",
-                                                  "📈 Resultados de Docking", "🧬 GROMACS", "⚡ OpenMM"])
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+        "👁️ Visor 3D & Preparación", 
+        "📊 Propiedades Fisicoquímicas & Secuencia",
+        "🧪 Preparación Docking (Vina)", 
+        "🚀 Docking (Vina)",
+        "📈 Resultados de Docking", 
+        "🧬 GROMACS", 
+        "⚡ OpenMM"
+    ])
+
+
+# ---PESTAÑAS ---
 
     with tab1:
         col_vis, col_panel = st.columns([1.5, 1])
@@ -2896,7 +2981,7 @@ if st.session_state.get("raw_pdb"):
                 file_name=f"{pdb_name}_clean.pdb",
                 mime="text/plain",
                 type="primary",
-                use_container_width=True,
+                width='stretch',
             )
             if result["ligand"].strip():
                 st.download_button(
@@ -2904,7 +2989,7 @@ if st.session_state.get("raw_pdb"):
                     data=result["ligand"].encode('utf-8'),
                     file_name=f"{pdb_name}_ligand.pdb",
                     mime="text/plain",
-                    use_container_width=True,
+                    width='stretch',
                 )
                 st.caption("Para docking usa la pestaña 🧪: ahí obtienes SDF/PDBQT con H y cargas.")
 
@@ -3005,7 +3090,7 @@ if st.session_state.get("raw_pdb"):
                     [{"Tipo": it["tipo"], "Residuo": f"{it['resname']}{it['resnum']}",
                       "Cadena": it["chain"], "Distancia (Å)": it["dist"]}
                      for it in sorted(inter_data["items"], key=lambda t: (t["chain"], t["resnum"], t["tipo"]))],
-                    use_container_width=True, hide_index=True)
+                    width='stretch', hide_index=True)
 
                 with st.expander("🗺️ Mapa 2D de interacciones", expanded=False):
                     dark_map = st.checkbox("Fondo oscuro", value=True, key=f"map_dark_{pdb_name}")
@@ -3049,10 +3134,34 @@ if st.session_state.get("raw_pdb"):
                         st.caption(pse_desc)
 
     with tab2:
-        st.markdown("### 📊 Propiedades Fisicoquímicas y Secuencia Primaria")
+        st.markdown("### 📊 Propiedades Fisicoquímicas, Metadatos RCSB y Secuencia")
         chains = result["chains"]
 
         if chains:
+            # --- NUEVA SECCIÓN: METADATOS CRISTALOGRÁFICOS / RCSB ---
+            rcsb_meta = extract_rcsb_metadata(raw_pdb)
+            
+            st.markdown("#### 🏛️ Información Cristalográfica / RCSB PDB")
+            meta_c1, meta_c2, meta_c3 = st.columns(3)
+            with meta_c1:
+                st.markdown(f"**Clasificación:** `{rcsb_meta['classification']}`")
+                st.markdown(f"**Método de determinación:** `{rcsb_meta['method']}`")
+            with meta_c2:
+                st.markdown(f"**Organismo:** `{rcsb_meta['organism']}`")
+                st.markdown(f"**Resolución:** `{rcsb_meta['resolution']}`")
+            with meta_c3:
+                st.markdown(f"**Sistema de expresión:** `{rcsb_meta['expression_system']}`")
+                st.markdown(f"**Mutaciones reportadas:** `{rcsb_meta['mutations']}`")
+
+            # Indicador de proteína de membrana
+            if rcsb_meta["is_membrane"]:
+                clues_str = ", ".join(rcsb_meta["membrane_clues"]) if rcsb_meta["membrane_clues"] else "anotación funcional"
+                st.info(f"🌐 **Predicción de tipo de proteína:** Clasificada probablemente como **Proteína de Membrana** (indicios detectados: *{clues_str}*). Ten en cuenta que para simulaciones de dinámica molecular requerirá una balsa lipídica o membrana bicapa.")
+            else:
+                st.success("💧 **Predicción de tipo de proteína:** Proteína globular / soluble estándar (no se han detectado marcadores típicos de membrana en los registros del PDB).")
+
+            st.markdown("---")
+
             chain_id = st.selectbox("Seleccionar Cadena para análisis:", list(chains.keys()),
                                     key=f"tab2_chain_{pdb_name}")
             residues = chains[chain_id]
@@ -3138,7 +3247,7 @@ if st.session_state.get("raw_pdb"):
                                    "Pega uno si lo conoces.")
 
                     lig_sig = (pdb_name, lig_label, ph, smiles.strip())
-                    if st.button("⚗️ Preparar ligando", type="primary", use_container_width=True,
+                    if st.button("⚗️ Preparar ligando", type="primary", width='stretch',
                                  key="btn_lig"):
                         try:
                             with st.spinner("Preparando ligando..."):
@@ -3174,7 +3283,7 @@ if st.session_state.get("raw_pdb"):
 
                     if ext_data:
                         ext_sig = (hashlib.md5(ext_data[1]).hexdigest(), ext_data[0], ph)
-                        if st.button("⚗️ Preparar ligando(s)", type="primary", use_container_width=True,
+                        if st.button("⚗️ Preparar ligando(s)", type="primary", width='stretch',
                                      key="btn_ext"):
                             try:
                                 mols = read_external_ligands(*ext_data)
@@ -3213,7 +3322,7 @@ if st.session_state.get("raw_pdb"):
                 method = st.radio("Método de protonación:", methods, key="rec_method")
                 rec_sig = (pdb_name, tuple(selected_chains), remove_ions, ph, method)
 
-                if st.button("⚗️ Preparar receptor", type="primary", use_container_width=True,
+                if st.button("⚗️ Preparar receptor", type="primary", width='stretch',
                              key="btn_rec"):
                     try:
                         with st.spinner("Protonando y calculando cargas (puede tardar en proteínas grandes)..."):
@@ -3234,10 +3343,10 @@ if st.session_state.get("raw_pdb"):
                     st.caption("PDBQT rígido: los H apolares se fusionan, como espera Vina.")
                     st.download_button("📥 Receptor (.pdbqt)", rec["pdbqt"].encode(),
                                        file_name=f"{pdb_name}_receptor.pdbqt", type="primary",
-                                       use_container_width=True)
+                                       width='stretch')
                     st.download_button("📥 Receptor protonado (.pdb)", rec["pdb"].encode(),
                                        file_name=f"{pdb_name}_receptor_H.pdb",
-                                       use_container_width=True)
+                                       width='stretch')
                 elif stored:
                     st.caption("Los ajustes han cambiado: pulsa de nuevo «Preparar receptor».")
 
@@ -3490,7 +3599,7 @@ if st.session_state.get("raw_pdb"):
                     st.caption("Referencia: con exhaustividad 8, el redocking de un ligando de 6 torsiones en una "
                                "proteína de ~5000 átomos tardó ≈ 30 s con 1 núcleo.")
 
-                if st.button("🚀 Ejecutar docking", type="primary", use_container_width=True, key="dk_run",
+                if st.button("🚀 Ejecutar docking", type="primary", width='stretch', key="dk_run",
                              disabled=not chosen):
                     out_items = {}
                     bar = st.progress(0.0, text="Preparando...")
@@ -3559,7 +3668,7 @@ if st.session_state.get("raw_pdb"):
                                  "RMSD mejor pose (Å)": None if best_rmsd is None else round(best_rmsd, 2),
                                  "Mejor RMSD de todas (Å)": None if best_any is None else round(best_any, 2),
                                  "Estado": "✅" if best_rmsd is None or best_rmsd <= 2.0 else "⚠️ > 2 Å"})
-                st.dataframe(rows, hide_index=True, use_container_width=True)
+                st.dataframe(rows, hide_index=True, width='stretch')
                 if rmsd_by_lig:
                     st.caption("RMSD frente al ligando cristalográfico (redocking, átomos pesados, sin alinear, "
                                "con simetría). ≤ 2 Å se considera una reproducción correcta de la pose experimental.")
@@ -3568,7 +3677,7 @@ if st.session_state.get("raw_pdb"):
                     pick = st.selectbox("Ver poses de:", list(good), key="dk_pick")
                     it_ = good[pick]
                     st.dataframe(pose_rows(poses_by_lig[pick], rmsd_by_lig.get(pick)),
-                                 hide_index=True, use_container_width=True)
+                                 hide_index=True, width='stretch')
                     st.caption(
                         "**Ki estimada** = exp(ΔG/RT) con ΔG = afinidad de Vina y T = 298,15 K. Es una estimación "
                         "orientativa: la puntuación de Vina no es un ΔG calibrado, así que úsala para comparar ligandos, "
@@ -3585,7 +3694,7 @@ if st.session_state.get("raw_pdb"):
                                            "Energía media del clúster": round(c_["mean"], 3),
                                            "Nº conformaciones en el clúster": c_["n"],
                                            "Runs totales": it_["runs"]} for c_ in it_["clusters"]],
-                                         hide_index=True, use_container_width=True)
+                                         hide_index=True, width='stretch')
                             st.caption("Cada run es una búsqueda independiente; se ordenan por energía y cada una se "
                                        "asigna al primer clúster cuyo representante esté a ≤ la tolerancia (RMSD "
                                        "átomo a átomo). Un clúster muy poblado indica una pose reproducible; uno con "
@@ -3597,12 +3706,12 @@ if st.session_state.get("raw_pdb"):
                     with q1:
                         st.download_button("📥 Poses de este ligando (.pdbqt)", it_["pdbqt"].encode(),
                                            file_name=f"{pick}_out.pdbqt", type="primary",
-                                           use_container_width=True, key="dk_dl1")
+                                           width='stretch', key="dk_dl1")
                     with q2:
                         st.download_button("📦 Todos los resultados (.zip)",
                                            zip_files({f"{n}_out.pdbqt": v["pdbqt"] for n, v in good.items()}),
                                            file_name=f"{pdb_name}_docking.zip", mime="application/zip",
-                                           use_container_width=True, key="dk_dl2")
+                                           width='stretch', key="dk_dl2")
                     st.info("Analiza las interacciones de estas poses en la pestaña 📈 «Resultados de Docking» "
                             "(elige «Docking ejecutado en la app»).")
 
@@ -3681,7 +3790,7 @@ if st.session_state.get("raw_pdb"):
                                 except Exception as e:
                                     rm_note = str(e)[:80]
                     rows5 = pose_rows(poses, rmsds if ref_choice != "Ninguno" else None)
-                    st.dataframe(rows5, hide_index=True, use_container_width=True)
+                    st.dataframe(rows5, hide_index=True, width='stretch')
                     st.caption("**RMSD l.b. / u.b. (vs pose 1)**: distancia entre cada pose y la mejor pose del archivo "
                                "(no frente al cristal): u.b. empareja cada átomo con su homólogo; l.b. con el átomo más "
                                "cercano del mismo elemento (l.b. ≤ u.b.). **Ki estimada** = exp(ΔG/RT), T = 298,15 K "
@@ -3740,7 +3849,7 @@ if st.session_state.get("raw_pdb"):
                                        "Cadena": it["chain"], "Distancia (Å)": it["dist"]}
                                       for it in sorted(p_filtered,
                                                        key=lambda t: (t["chain"], t["resnum"], t["tipo"]))],
-                                     use_container_width=True, hide_index=True)
+                                     width='stretch', hide_index=True)
                     elif not p_items:
                         st.info("No se detectaron interacciones para esta pose.")
 
@@ -3762,12 +3871,12 @@ if st.session_state.get("raw_pdb"):
                     d1, d2 = st.columns(2)
                     with d1:
                         st.download_button("📥 Pose (.sdf)", (Chem.MolToMolBlock(pmol) + "$$$$\n").encode(),
-                                           file_name=f"pose_{pose_idx + 1}.sdf", use_container_width=True,
+                                           file_name=f"pose_{pose_idx + 1}.sdf", width='stretch',
                                            key="res_dl_sdf")
                     with d2:
                         st.download_button("📥 Complejo receptor + pose (.pdb)", cpx.encode(),
                                            file_name=f"complejo_pose_{pose_idx + 1}.pdb",
-                                           use_container_width=True, key="res_dl_cpx")
+                                           width='stretch', key="res_dl_cpx")
 
                     pm_custom5 = pymol_ui("t5")
                     pse5 = f"res_pse_{pose_idx}_{hashlib.md5(cpx.encode()).hexdigest()[:8]}"
@@ -3811,13 +3920,13 @@ if st.session_state.get("raw_pdb"):
                         if stored_sum and stored_sum[0] == sum_sig:
                             _, per_pose, rows = stored_sum
                             st.markdown("**Interacciones por pose**")
-                            st.dataframe(rows, hide_index=True, use_container_width=True)
+                            st.dataframe(rows, hide_index=True, width='stretch')
                             matrix = interaction_matrix(per_pose)
                             if matrix:
                                 st.markdown("**Residuos × poses** (HB puente H · HP hidrofóbico · SB puente salino · "
                                             "πS apilamiento π · πC π–catión · HX halógeno · WB agua · MC metal; "
                                             "`~` = aproximado)")
-                                st.dataframe(matrix, hide_index=True, use_container_width=True)
+                                st.dataframe(matrix, hide_index=True, width='stretch')
                                 st.bar_chart({f"{r['Residuo']}:{r['Cadena']}": r["Nº poses"] for r in matrix[:15]})
                             else:
                                 st.info("No se detectaron interacciones en las poses analizadas.")
@@ -3941,7 +4050,7 @@ if st.session_state.get("raw_pdb"):
                       npt_ps=float(npt6), prod_ns=float(prod6), out_ps=float(out6), gaff=gaff6, charges=charges6)
             sig6 = (kind, lig_desc, tuple(sorted(p6.items())), hashlib.md5(protein_text6.encode()).hexdigest()[:8])
 
-            if st.button("📦 Generar paquete GROMACS", type="primary", use_container_width=True, key="gm_go"):
+            if st.button("📦 Generar paquete GROMACS", type="primary", width='stretch', key="gm_go"):
                 try:
                     ligand6, lig_files6, net6 = None, None, 0
                     if has_lig6:
@@ -4010,7 +4119,7 @@ if st.session_state.get("raw_pdb"):
                     st.caption("Estados de protonación respetados: " +
                                ", ".join(f"{v} × {k}" for k, v in sorted(pkg["info"]["changes"].items())))
                 st.download_button("📥 Descargar paquete GROMACS (.zip)", pkg["zip"], file_name=f"{name6}.zip",
-                                   mime="application/zip", type="primary", use_container_width=True, key="gm_dl")
+                                   mime="application/zip", type="primary", width='stretch', key="gm_dl")
                 with st.expander("📄 Archivos del paquete"):
                     st.code("\n".join(pkg["files"]), language="text")
                 with st.expander("▶️ run_gromacs.sh (flujo completo)"):
@@ -4081,7 +4190,7 @@ if st.session_state.get("raw_pdb"):
                   temp=float(temp7), dt=dt7 / 1000.0, em_steps=5000, nvt_ps=float(nvt7),
                   prod_ns=float(prod7), out_ps=10.0)
 
-        if st.button("📦 Generar paquete OpenMM", type="primary", use_container_width=True, key="omm_go"):
+        if st.button("📦 Generar paquete OpenMM", type="primary", width='stretch', key="omm_go"):
             try:
                 files7 = build_openmm_package(p7, protein_text7, has_ligand="Complejo" in kind7)
                 zip_omm = zip_bytes(files7)
@@ -4099,6 +4208,6 @@ if st.session_state.get("raw_pdb"):
         if pkg7:
             name7 = f"{pdb_name}_openmm"
             st.download_button("📥 Descargar paquete OpenMM (.zip)", pkg7["zip"], file_name=f"{name7}.zip",
-                               mime="application/zip", type="primary", use_container_width=True, key="omm_dl")
+                               mime="application/zip", type="primary", width='stretch', key="omm_dl")
             with st.expander("📄 Código del script Python (run_openmm.py)"):
                 st.code(pkg7["script"], language="python")
