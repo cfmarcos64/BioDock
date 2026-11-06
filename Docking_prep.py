@@ -2653,6 +2653,108 @@ def zip_bytes(files):
     return buf.getvalue()
 
 
+# --- EXPORTACIÓN A OPENMM ---
+
+def build_openmm_script(p, has_ligand):
+    """Genera el script en Python para ejecutar la simulación con OpenMM."""
+    lig_import = "from openmm.app import Modeller\n" if has_ligand else ""
+    water_xml = GMX_WATERS.get(p["water"], "tip3p").replace(".gro", ".xml")
+    
+    template = "# -*- coding: utf-8 -*-\n" \
+               "\"\"\"\n" \
+               "Script de Dinámica Molecular generado por BioDock Studio para OpenMM.\n" \
+               "Uso: python3 run_openmm.py\n" \
+               "\"\"\"\n" \
+               "import sys\n" \
+               "from openmm import *\n" \
+               "from openmm.app import *\n" \
+               "from openmm import unit\n" \
+               "{lig_import}\n" \
+               "print(\"==> 1/5 Cargando la estructura y el campo de fuerzas...\")\n" \
+               "forcefield = ForceField('{ff}.xml', '{water_xml}')\n\n" \
+               "pdb = PDBFile('protein_amber.pdb')\n" \
+               "modeller = Modeller(pdb.topology, pdb.positions)\n\n" \
+               "print(\"==> 2/5 Solvatando y añadiendo iones en caja {box}...\")\n" \
+               "modeller.addSolvent(forcefield, padding={dist}*unit.nanometer, ionicStrength={conc}*unit.molar)\n\n" \
+               "system = forcefield.createSystem(\n" \
+               "    modeller.topology,\n" \
+               "    nonbondedMethod=PME,\n" \
+               "    nonbondedCutoff=1.0*unit.nanometers,\n" \
+               "    constraints=HBonds\n" \
+               ")\n\n" \
+               "integrator = LangevinMiddleIntegrator({temp}*unit.kelvin, 1.0/unit.picosecond, {dt}*unit.picoseconds)\n\n" \
+               "try:\n" \
+               "    platform = Platform.getPlatformByName('CUDA')\n" \
+               "    properties = {{'Precision': 'mixed'}}\n" \
+               "except Exception:\n" \
+               "    try:\n" \
+               "        platform = Platform.getPlatformByName('OpenCL')\n" \
+               "        properties = {{}}\n" \
+               "    except Exception:\n" \
+               "        platform = Platform.getPlatformByName('CPU')\n" \
+               "        properties = {{}}\n\n" \
+               "print(\"==> Ejecutando en plataforma: \" + platform.getName())\n" \
+               "simulation = Simulation(modeller.topology, system, integrator, platform, properties)\n" \
+               "simulation.context.setPositions(modeller.positions)\n\n" \
+               "print(\"==> 3/5 Minimización de energía...\")\n" \
+               "simulation.minimizeEnergy(maxIterations={em_steps})\n\n" \
+               "positions = simulation.context.getState(getPositions=True).getPositions()\n" \
+               "PDBFile.writeFile(simulation.topology, positions, open('minimized.pdb', 'w'))\n\n" \
+               "print(\"==> 4/5 Equilibración NVT ({nvt_ps} ps)...\")\n" \
+               "simulation.step({steps_nvt})\n\n" \
+               "print(\"==> 5/5 Producción ({prod_ns} ns)...\")\n" \
+               "steps_prod = {steps_p}\n" \
+               "steps_out = {steps_o}\n\n" \
+               "simulation.reporters.append(DCDReporter('trajectory.dcd', steps_out))\n" \
+               "simulation.reporters.append(StateDataReporter('scalars.csv', steps_out, step=True, potentialEnergy=True, temperature=True, density=True, speed=True))\n\n" \
+               "simulation.step(steps_prod)\n" \
+               "print(\"¡Simulación completada! Trayectoria en 'trajectory.dcd' y métricas en 'scalars.csv'.\")\n"
+    
+    steps_nvt = int(p['nvt_ps'] / p['dt'])
+    steps_p = int(p['prod_ns'] * 1000 / p['dt'])
+    steps_o = int(p['out_ps'] / p['dt'])
+
+    return template.format(
+        lig_import=lig_import,
+        ff=p["ff"],
+        water_xml=water_xml,
+        box=p["box"],
+        dist=p["dist"],
+        conc=p["conc"],
+        temp=p["temp"],
+        dt=p["dt"],
+        em_steps=p["em_steps"],
+        nvt_ps=p["nvt_ps"],
+        prod_ns=p["prod_ns"],
+        steps_nvt=steps_nvt,
+        steps_p=steps_p,
+        steps_o=steps_o
+    )
+
+
+def build_openmm_package(p, protein_pdb, has_ligand=False):
+    """Crea el diccionario de archivos para el paquete descargable de OpenMM."""
+    prot_lines = [l for l in protein_pdb.splitlines() if l.startswith(("ATOM", "HETATM", "TER"))]
+    prot_txt, _ = amberize_pdb("\n".join(prot_lines) + "\nEND\n")
+    
+    readme_text = "# Entrada para OpenMM — Generado por BioDock Studio\n\n" \
+                  "## Contenido\n" \
+                  "- `protein_amber.pdb`: Estructura proteica preparada.\n" \
+                  "- `run_openmm.py`: Script de ejecución en Python.\n\n" \
+                  "## Ejecución\n" \
+                  "```bash\n" \
+                  "python3 run_openmm.py\n" \
+                  "```\n" \
+                  "Requisitos: OpenMM (`conda install -c conda-forge openmm`)\n"
+
+    files = {
+        "protein_amber.pdb": prot_txt,
+        "run_openmm.py": build_openmm_script(p, has_ligand),
+        "README.md": readme_text
+    }
+    return files
+
+
 # --- INTERFAZ STREAMLIT ---
 
 st.title("🧬 BioDock Studio: Inspector PDB & Preparación de Docking")
@@ -2669,24 +2771,40 @@ with col_input1:
 
 with col_input2:
     if input_method == "Código PDB (Ej. 1HSG, 4AKE)":
+        # Función callback para activar la búsqueda al pulsar Enter
+        def _trigger_fetch():
+            st.session_state["do_fetch_pdb"] = True
+
         c_code, c_btn = st.columns([2, 1])
         with c_code:
-            pdb_code = st.text_input("Código PDB:", value="1HSG").strip()
+            pdb_code = st.text_input(
+                "Código PDB:", 
+                value="1HSG", 
+                key="pdb_code_input",
+                on_change=_trigger_fetch
+            ).strip()
+            
         with c_btn:
             st.markdown("<br>", unsafe_allow_html=True)
             btn_fetch = st.button("Buscar en RCSB", type="primary")
 
-        if btn_fetch and pdb_code:
-            with st.spinner("Descargando estructura..."):
-                data = fetch_pdb_from_web(pdb_code)
-                if data:
-                    st.session_state["raw_pdb"] = data
-                    st.session_state["pdb_name"] = pdb_code.upper()
-                    # Extraer el nombre de la molécula directamente del texto PDB
-                    protein_name = extract_molecule_name(data, default_code=pdb_code)
-                    st.success(f"¡Estructura de '{protein_name}' cargada con éxito!")
-                else:
-                    st.error("Error al descargar el PDB.")
+        # Comprobamos si se pulsó el botón O si se activó el evento de Enter (on_change)
+        if btn_fetch or st.session_state.get("do_fetch_pdb", False):
+            # Reseteamos el flag de enter para que no se ejecute en bucles posteriores
+            st.session_state["do_fetch_pdb"] = False
+            
+            if pdb_code:
+                with st.spinner("Descargando estructura..."):
+                    data = fetch_pdb_from_web(pdb_code)
+                    if data:
+                        st.session_state["raw_pdb"] = data
+                        st.session_state["pdb_name"] = pdb_code.upper()
+                        protein_name = extract_molecule_name(data, default_code=pdb_code)
+                        st.success(f"¡Estructura de '{protein_name}' cargada con éxito!")
+                        st.rerun() # Actualiza la interfaz de inmediato
+                    else:
+                        st.error("Error al descargar el PDB.")
+                        
     else:
         uploaded_file = st.file_uploader("Sube tu archivo .pdb", type=["pdb"])
         if uploaded_file is not None:
@@ -2701,9 +2819,9 @@ if st.session_state.get("raw_pdb"):
     all_chains = list(chain_summary.keys())
 
     st.markdown("---")
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["👁️ Visor 3D & Preparación", "📊 Propiedades Fisicoquímicas & Secuencia",
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(["👁️ Visor 3D & Preparación", "📊 Propiedades Fisicoquímicas & Secuencia",
                                                   "🧪 Preparación Docking (Vina)", "🚀 Docking (Vina)",
-                                                  "📈 Resultados de Docking", "🧬 GROMACS"])
+                                                  "📈 Resultados de Docking", "🧬 GROMACS", "⚡ OpenMM"])
 
     with tab1:
         col_vis, col_panel = st.columns([1.5, 1])
@@ -3252,7 +3370,7 @@ if st.session_state.get("raw_pdb"):
                        f"out = {dock_name}_out.pdbqt\n\n"
                        f"center_x = {cx:.3f}\ncenter_y = {cy:.3f}\ncenter_z = {cz:.3f}\n"
                        f"size_x = {sx:.1f}\nsize_y = {sy:.1f}\nsize_z = {sz:.1f}\n\n"
-                       f"exhaustiveness = 8\nnum_modes = 9\n")
+                       f"exhaustiveness = 8\nnum_modes = 9\ncpu = 1\n")
                 st.session_state["box_params"] = ((cx, cy, cz), (sx, sy, sz))
                 st.code(cfg, language="ini")
                 st.download_button("📥 Descargar config de Vina (.txt)", cfg.encode(),
@@ -3905,3 +4023,82 @@ if st.session_state.get("raw_pdb"):
                         st.code(pkg["log"][-6000:], language="text")
             elif pkg:
                 st.caption("Los ajustes han cambiado: pulsa de nuevo «Generar paquete GROMACS».")
+                
+    with tab7:
+        st.markdown("### ⚡ Entrada para OpenMM (Dinámica Molecular en Python)")
+        st.caption("Genera un entorno en Python puro optimizado para GPUs usando OpenMM. "
+                   "Crea automáticamente la caja, solvatación, minimización y producción.")
+        
+        # Comprobar si OpenMM está instalado localmente
+        has_openmm = importlib.util.find_spec("openmm") is not None
+        if has_openmm:
+            st.success("✅ **OpenMM** detectado en el entorno actual.")
+        else:
+            st.info("⚪ **OpenMM** no detectado en este entorno. Se generará el paquete en Python para ejecutarlo donde prefieras.")
+
+        dock7 = st.session_state.get("dock_results")
+        good7 = {n: v for n, v in (dock7["items"] if dock7 else {}).items() if v.get("ok")}
+        cry7 = st.session_state.get("lig_prep")
+        
+        kinds7 = []
+        if good7:
+            kinds7.append("Complejo con una pose de docking")
+        if cry7:
+            kinds7.append("Complejo con el ligando cristalográfico preparado")
+        kinds7.append("Solo proteína (apo)")
+        
+        kind7 = st.radio("Sistema a simular (OpenMM):", kinds7, key="omm_kind")
+        
+        prepared_rec7 = st.session_state.get("rec_prep")
+        protein_text7 = prepared_rec7[1]["pdb"] if prepared_rec7 else result["cleaned"]
+
+        st.markdown("#### Parámetros de la simulación")
+        o_a, o_b, o_c = st.columns(3)
+        with o_a:
+            ff7 = st.selectbox("Campo de fuerzas", ["amber14-all", "amber99sbildn", "amber03"], key="omm_ff")
+        with o_b:
+            water7 = st.selectbox("Agua", ["tip3p", "spce", "tip4pew"], key="omm_water")
+        with o_c:
+            box7 = st.selectbox("Geometría de caja", ["cubic", "dodecahedron"], key="omm_box")
+
+        o_d, o_e, o_f = st.columns(3)
+        with o_d:
+            dist7 = st.number_input("Distancia al borde (nm)", 0.8, 3.0, 1.0, 0.1, key="omm_dist")
+        with o_e:
+            conc7 = st.number_input("Conc. NaCl (M)", 0.0, 1.0, 0.15, 0.05, key="omm_conc")
+        with o_f:
+            temp7 = st.number_input("Temperatura (K)", 250.0, 400.0, 300.0, 1.0, key="omm_temp")
+
+        o_g, o_h, o_i = st.columns(3)
+        with o_g:
+            dt7 = st.selectbox("Paso de tiempo (fs)", [2, 1, 4], key="omm_dt")
+        with o_h:
+            nvt7 = st.number_input("NVT (ps)", 1.0, 1000.0, 100.0, 10.0, key="omm_nvt")
+        with o_i:
+            prod7 = st.number_input("Producción (ns)", 0.001, 1000.0, 10.0, 1.0, key="omm_prod")
+
+        p7 = dict(ff=ff7, water=water7, box=box7, dist=float(dist7), conc=float(conc7),
+                  temp=float(temp7), dt=dt7 / 1000.0, em_steps=5000, nvt_ps=float(nvt7),
+                  prod_ns=float(prod7), out_ps=10.0)
+
+        if st.button("📦 Generar paquete OpenMM", type="primary", use_container_width=True, key="omm_go"):
+            try:
+                files7 = build_openmm_package(p7, protein_text7, has_ligand="Complejo" in kind7)
+                zip_omm = zip_bytes(files7)
+                
+                st.session_state["omm_pkg"] = {
+                    "zip": zip_omm,
+                    "script": files7["run_openmm.py"],
+                    "files": sorted(files7.keys())
+                }
+                st.success("✅ Paquete OpenMM generado correctamente.")
+            except Exception as e:
+                st.error(f"No se pudo generar el paquete: {e}")
+
+        pkg7 = st.session_state.get("omm_pkg")
+        if pkg7:
+            name7 = f"{pdb_name}_openmm"
+            st.download_button("📥 Descargar paquete OpenMM (.zip)", pkg7["zip"], file_name=f"{name7}.zip",
+                               mime="application/zip", type="primary", use_container_width=True, key="omm_dl")
+            with st.expander("📄 Código del script Python (run_openmm.py)"):
+                st.code(pkg7["script"], language="python")
