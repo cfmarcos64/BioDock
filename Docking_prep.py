@@ -159,7 +159,9 @@ def fetch_pdb_from_web(pdb_code):
     
 
 
-# --- CONFIGURACIÓN DE PÁGINA STREAMLIT ---
+# ==============================================================================
+# 1. CONFIGURACIÓN DE PÁGINA Y CARGA DE DATOS STREAMLIT
+# ==============================================================================
 st.set_page_config(
     page_title="BioDock Studio | Prep & Inspector",
     page_icon="🧬",
@@ -168,7 +170,7 @@ st.set_page_config(
 
 st.title("🧬 BioDock Studio: Inspector PDB & Preparación de Docking")
 
-# Cabecera persistente del nombre de la proteína activa si ya está cargada
+# Cabecera persistente si la proteína ya está cargada
 if st.session_state.get("raw_pdb"):
     p_name_display = st.session_state.get("pdb_name", "PROTEIN")
     p_molecule_title = st.session_state.get("molecule_title", "Complejo Proteico")
@@ -181,9 +183,11 @@ st.markdown("### 📥 1. Cargar Estructura Proteica")
 col_input1, col_input2 = st.columns([1, 2])
 
 with col_input1:
-    input_method = st.radio("Método de entrada:",
-                            ["Código PDB (Ej. 1HSG, 4AKE)", "Subir archivo .pdb local"],
-                            key="input_method")
+    input_method = st.radio(
+        "Método de entrada:",
+        ["Código PDB (Ej. 1HSG, 4AKE)", "Subir archivo .pdb local"],
+        key="input_method"
+    )
 
 with col_input2:
     if input_method == "Código PDB (Ej. 1HSG, 4AKE)":
@@ -212,9 +216,9 @@ with col_input2:
                     if data:
                         st.session_state["raw_pdb"] = data
                         st.session_state["pdb_name"] = pdb_code.upper()
-                        # Guardar el nombre oficial extraído de los registros COMPND
-                        st.session_state["molecule_title"] = extract_molecule_name(data, default_code=pdb_code)
-                        st.success(f"¡Estructura cargada con éxito!")
+                        protein_name = extract_molecule_name(data, default_code=pdb_code)
+                        st.session_state["molecule_title"] = protein_name
+                        st.success(f"¡Estructura de '{protein_name}' cargada con éxito!")
                         st.rerun()
                     else:
                         st.error("Error al descargar el PDB.")
@@ -227,7 +231,9 @@ with col_input2:
             st.session_state["pdb_name"] = uploaded_file.name.rsplit('.', 1)[0]
             st.session_state["molecule_title"] = extract_molecule_name(pdb_content, default_code=uploaded_file.name)
 
-# --- TEMA NEGRO (CSS) ---
+# ==============================================================================
+# 2. ESTILOS CSS Y DICCIONARIOS GLOBALES
+# ==============================================================================
 st.markdown(
     """
 <style>
@@ -258,17 +264,17 @@ hr { border-color: var(--border) !important; }
 /* Botones */
 .stButton > button, .stDownloadButton > button {
     border-radius: 10px !important; 
-    border: 1px solid #3a445d !important; /* Mismo borde visible para los botones */
+    border: 1px solid #3a445d !important; 
     background: #0f131b !important; 
     color: var(--text) !important; 
 }
 
 .stButton > button:hover, .stDownloadButton > button:hover {
-    border-color: var(--accent) !important; /* Se ilumina en verde al pasar el ratón */
+    border-color: var(--accent) !important; 
     color: var(--accent) !important; 
 }
 
-/* Desplegables flotantes (popovers) */
+/* Desplegables flotantes */
 div[data-baseweb="popover"] ul, div[data-baseweb="popover"] > div { 
     background-color: var(--panel) !important; 
     border: 1px solid #3a445d !important;
@@ -280,22 +286,19 @@ span[data-baseweb="tag"] {
 }
 
 /* Inputs */
-/* Campos de texto, selectores, áreas de texto y uploader */
 div[data-baseweb="select"] > div, 
 div[data-baseweb="input"] > div, 
 textarea,
 [data-testid="stFileUploaderDropzone"] { 
     background-color: var(--panel) !important;
-    border: 1px solid #3a445d !important; /* Borde gris claro y visible sobre fondo negro */
+    border: 1px solid #3a445d !important; 
     color: #ffffff !important; 
 }
 
-/* Forzar color de texto blanco y nítido dentro de los inputs */
 input, textarea, div[data-baseweb="select"] span {
     color: #ffffff !important;
 }
 
-/* Texto secundario / placeholder */
 input::placeholder, textarea::placeholder {
     color: #9ca3af !important; 
 }
@@ -323,6 +326,30 @@ AA_3TO1 = {
 }
 WATER_NAMES = {"HOH", "WAT", "DOD", "H2O"}
 COMMON_IONS = {"NA", "CL", "K", "MG", "ZN", "CA", "FE", "CU", "MN", "SO4", "PO4", "EDTA"}
+
+# ==============================================================================
+# 3. PREPARACIÓN DE VARIABLES Y RENDERIZADO DE PESTAÑAS (TABS)
+# ==============================================================================
+if st.session_state.get("raw_pdb"):
+    raw_pdb = st.session_state["raw_pdb"]
+    pdb_name = st.session_state.get("pdb_name", "Protein")
+    chain_summary = get_chain_summary(raw_pdb)
+    all_chains = list(chain_summary.keys())
+
+    st.markdown("---")
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+        "👁️ Visor 3D & Preparación", 
+        "📊 Propiedades Fisicoquímicas & Secuencia",
+        "🧪 Preparación Docking (Vina)", 
+        "🚀 Docking (Vina)",
+        "📈 Resultados de Docking", 
+        "🧬 GROMACS", 
+        "⚡ OpenMM"
+    ])
+
+    # A continuación continuas con:
+    # with tab1:
+    #     ...
 
 
 # --- FUNCIONES AUXILIARES ---
@@ -2884,73 +2911,7 @@ def build_openmm_package(p, protein_pdb, has_ligand=False):
     return files
 
 
-# --- INTERFAZ STREAMLIT ---
-
-st.title("🧬 BioDock Studio: Inspector PDB & Preparación de Docking")
-st.markdown("Herramienta bioinformática avanzada para visualización y preparación de complejos macromoleculares.")
-st.markdown("---")
-
-st.markdown("### 📥 1. Cargar Estructura Proteica")
-col_input1, col_input2 = st.columns([1, 2])
-
-with col_input1:
-    input_method = st.radio("Método de entrada:",
-                            ["Código PDB (Ej. 1HSG, 4AKE)", "Subir archivo .pdb local"],
-                            key="input_method")
-
-with col_input2:
-    if input_method == "Código PDB (Ej. 1HSG, 4AKE)":
-        # Función callback para activar la búsqueda al pulsar Enter
-        def _trigger_fetch():
-            st.session_state["do_fetch_pdb"] = True
-
-        c_code, c_btn = st.columns([2, 1])
-        with c_code:
-            pdb_code = st.text_input(
-                "Código PDB:", 
-                value="1HSG", 
-                key="pdb_code_input",
-                on_change=_trigger_fetch
-            ).strip()
-            
-        with c_btn:
-            st.markdown("<br>", unsafe_allow_html=True)
-            btn_fetch = st.button("Buscar en RCSB", type="primary")
-
-        # Comprobamos si se pulsó el botón O si se activó el evento de Enter (on_change)
-        if btn_fetch or st.session_state.get("do_fetch_pdb", False):
-            # Reseteamos el flag de enter para que no se ejecute en bucles posteriores
-            st.session_state["do_fetch_pdb"] = False
-            
-            if pdb_code:
-                with st.spinner("Descargando estructura..."):
-                    data = fetch_pdb_from_web(pdb_code)
-                    if data:
-                        st.session_state["raw_pdb"] = data
-                        st.session_state["pdb_name"] = pdb_code.upper()
-                        protein_name = extract_molecule_name(data, default_code=pdb_code)
-                        st.success(f"¡Estructura de '{protein_name}' cargada con éxito!")
-                        st.rerun() # Actualiza la interfaz de inmediato
-                    else:
-                        st.error("Error al descargar el PDB.")
-                        
-    else:
-        uploaded_file = st.file_uploader("Sube tu archivo .pdb", type=["pdb"])
-        if uploaded_file is not None:
-            # getvalue() (no read()): read() devuelve vacío en las recargas siguientes
-            st.session_state["raw_pdb"] = uploaded_file.getvalue().decode('utf-8', errors='ignore')
-            st.session_state["pdb_name"] = uploaded_file.name.rsplit('.', 1)[0]
-
-if st.session_state.get("raw_pdb"):
-    raw_pdb = st.session_state["raw_pdb"]
-    pdb_name = st.session_state.get("pdb_name", "Protein")
-    chain_summary = get_chain_summary(raw_pdb)
-    all_chains = list(chain_summary.keys())
-
-    st.markdown("---")
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(["👁️ Visor 3D & Preparación", "📊 Propiedades Fisicoquímicas & Secuencia",
-                                                  "🧪 Preparación Docking (Vina)", "🚀 Docking (Vina)",
-                                                  "📈 Resultados de Docking", "🧬 GROMACS", "⚡ OpenMM"])
+# ---PESTAÑAS ---
 
     with tab1:
         col_vis, col_panel = st.columns([1.5, 1])
